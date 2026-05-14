@@ -18,6 +18,7 @@ The setup wizard probes your endpoint and auto-detects which transport it uses, 
 - An Azure AI Foundry or Azure OpenAI resource with at least one deployment
 - An API key for that resource (available in the Azure Portal under "Keys and Endpoint")
 - The deployment's endpoint URL
+- **Either** an API key (from the Azure Portal under "Keys and Endpoint") **or** the **Cognitive Services User** RBAC role on the Foundry resource if you plan to use Microsoft Entra ID (the keyless path Microsoft recommends).
 
 ## Quick Start
 
@@ -25,7 +26,11 @@ The setup wizard probes your endpoint and auto-detects which transport it uses, 
 hermes model
 # → Select "Azure Foundry"
 # → Enter your endpoint URL
-# → Enter your API key
+# → Choose Authentication:
+#     1. API key
+#     2. Microsoft Entra ID  (managed identity / az login / service principal)
+# → (Entra) Hermes probes DefaultAzureCredential; on success it never asks for a key
+# → (API key) Enter your API key
 # Hermes probes the endpoint and auto-detects transport + models
 # → Pick a model from the list (or type a deployment name manually)
 ```
@@ -38,6 +43,142 @@ The wizard will:
 4. **Fall back to manual entry** — private/gated endpoints that reject every probe still work; you pick the API mode and type a deployment name by hand.
 
 Context length for the chosen model is resolved via Hermes' standard metadata chain (`models.dev`, provider metadata, and hardcoded family fallbacks) and stored in `config.yaml` so the model can size its own context window correctly.
+
+## Microsoft Entra ID (keyless, RBAC) — recommended
+
+Microsoft recommends [keyless authentication with Microsoft Entra ID](https://learn.microsoft.com/azure/ai-foundry/foundry-models/how-to/configure-entra-id) for production Foundry workloads. Hermes supports Entra ID for **both** API surfaces:
+
+- **OpenAI-style** (`api_mode: chat_completions` / `codex_responses`) — GPT-4/5, Llama, Mistral, DeepSeek, etc.
+- **Anthropic-style** (`api_mode: anthropic_messages`) — Claude models on Azure Foundry.
+
+Foundry's RBAC is per-resource (`Cognitive Services User` role grants both surfaces) and Microsoft documents the same inference scope (`https://ai.azure.com/.default`) for both. Under the hood:
+
+- OpenAI-style uses the OpenAI Python SDK's native callable `api_key=` contract — the SDK mints a fresh JWT per request automatically.
+- Anthropic-style uses an `httpx.Client` with a request event hook installed by `agent.azure_identity_adapter.build_bearer_http_client`, because the Anthropic SDK does not accept callable `auth_token` natively. The hook rewrites `Authorization: Bearer <fresh-jwt>` per outbound request. Same Microsoft RBAC, same Foundry scope — the SDK contract is the only difference.
+
+### Why use Entra ID?
+
+- No long-lived API keys to rotate or revoke.
+- RBAC-driven access — grant or remove `Cognitive Services User` on the Foundry resource, no config rewrite needed.
+- Single auth surface for Azure VMs, AKS pods, App Service, Functions, and Container Apps via Managed Identity.
+- Service principal + workload identity flows for CI/CD pipelines.
+
+### One-time setup (Azure side)
+
+1. In the Azure Portal, open your Foundry resource → **Access control (IAM)** → **Add → Add role assignment**.
+2. Pick the **Cognitive Services User** role.
+3. Assign it to:
+   - **Your user account** for local development with `az login`.
+   - **A managed identity** for Azure-hosted compute (recommended for production).
+   - **A service principal** for CI/CD pipelines.
+4. Wait ~5 minutes for the role to propagate.
+
+### One-time setup (Hermes side)
+
+```bash
+hermes model
+# → Select "Azure Foundry"
+# → Enter your endpoint URL
+# → Authentication: 2 (Microsoft Entra ID)
+# → (optional) user-assigned managed identity client ID
+# → (optional) Azure tenant ID
+# → Hermes probes DefaultAzureCredential() and reports which inner
+#    credential succeeded (e.g. AzureCliCredential, ManagedIdentityCredential)
+```
+
+The wizard runs a bounded preflight probe (10 s timeout). On failure it offers to "save anyway, validate later" — useful when configuring on a machine that doesn't yet have credentials but will at runtime (e.g. preparing config for a managed-identity deployment).
+
+`azure-identity` is installed automatically on first use via Hermes' lazy-install path. To pre-install:
+
+```bash
+pip install azure-identity
+```
+
+### Configuration written to `config.yaml`
+
+```yaml
+model:
+  provider: azure-foundry
+  base_url: https://my-resource.openai.azure.com/openai/v1
+  api_mode: chat_completions
+  auth_mode: entra_id
+  default: gpt-4o
+  context_length: 128000
+  entra:
+    scope: https://ai.azure.com/.default        # only when overriding the default
+    client_id: 11111111-1111-1111-1111-111111111111      # only for user-assigned MI
+```
+
+Hermes only manages two Entra knobs in `config.yaml`:
+
+- **`scope`** — the OAuth resource scope. Defaults to Microsoft's documented inference scope (`https://ai.azure.com/.default`). Override only if your resource was provisioned against a non-standard audience.
+- **`client_id`** — the user-assigned managed identity to bind. `ManagedIdentityCredential` only accepts this as a kwarg, not an env var. Mirrored into `workload_identity_client_id` so AKS workload-identity setups work too.
+
+Everything else (tenant, service principal secret, federated token file, sovereign cloud authority, broker preferences) is read by `azure-identity` directly from the standard `AZURE_*` environment variables — see the [credential resolution order](#credential-resolution-order) below. Set those in `~/.hermes/.env` or your deployment environment, exactly as Microsoft's SDK reference describes.
+
+No secrets land in `~/.hermes/.env` for Entra mode — `azure-identity` caches tokens in-process (and where available, in your OS keychain / `~/.IdentityService`).
+
+### Credential resolution order
+
+`azure-identity`'s `DefaultAzureCredential` walks this chain on each token request, stopping at the first credential that returns a token:
+
+1. **Environment credential** — `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` (or `AZURE_CLIENT_CERTIFICATE_PATH` / `AZURE_FEDERATED_TOKEN_FILE`).
+2. **Workload Identity** — `AZURE_FEDERATED_TOKEN_FILE` (AKS federated tokens / OIDC).
+3. **Managed Identity** — IMDS endpoint (`IDENTITY_ENDPOINT` for App Service / Functions / Container Apps; raw 169.254.169.254 for VMs).
+4. **Visual Studio Code** — Azure account extension.
+5. **Azure CLI** — `az login` session.
+6. **Azure Developer CLI** — `azd auth login`.
+7. **Azure PowerShell** — `Connect-AzAccount`.
+8. **Broker** (Windows / WSL only) — Web Account Manager.
+
+Interactive browser credential is excluded by default for unattended runs. Set `model.entra.exclude_interactive_browser: false` to opt in.
+
+### Deployment patterns
+
+**Local development:**
+```bash
+az login
+hermes model   # pick Azure Foundry → Entra ID
+hermes         # uses your az login token
+```
+
+**Azure VM / Functions / Container Apps (system-assigned managed identity):**
+1. Enable system-assigned identity on the compute resource.
+2. Grant the identity `Cognitive Services User` on the Foundry resource.
+3. Set `model.auth_mode: entra_id` in config.yaml — no env vars needed.
+
+**Azure VM with user-assigned managed identity:**
+- Set `model.entra.client_id` to the user-assigned identity's client ID so `DefaultAzureCredential` picks the right one.
+
+**AKS Workload Identity (replaces AAD Pod Identity):**
+- Annotate the pod's service account with the workload identity client ID.
+- The pod's federated token file is auto-detected via `AZURE_FEDERATED_TOKEN_FILE`.
+- `model.auth_mode: entra_id` works without further config changes.
+
+**Service principal in CI:**
+- Set `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` in the runner env.
+
+**Sovereign clouds (Government, China):**
+- Export `AZURE_AUTHORITY_HOST` (e.g. `https://login.microsoftonline.us` for Azure Government, `https://login.partner.microsoftonline.cn` for Azure China). `azure-identity` reads it directly.
+
+### Health checks
+
+`hermes doctor` runs a 10 s probe against `DefaultAzureCredential` when `model.auth_mode: entra_id`, reporting which inner credential won (env vars present, managed identity endpoint reachable, etc.).
+
+`hermes auth` shows a structured status block:
+
+```
+azure-foundry (Microsoft Entra ID):
+  Endpoint: https://my-resource.openai.azure.com/openai/v1
+  Scope: https://ai.azure.com/.default
+  Status: ✓ token acquired (default chain)
+```
+
+### Limitations
+
+- **Anthropic-style endpoints use an httpx event hook.** The Anthropic Python SDK does not accept a callable `auth_token` natively (≤ 0.86.0). Hermes installs a request event hook on a custom `httpx.Client` that mints a fresh JWT per outbound request and rewrites `Authorization: Bearer <jwt>`. This is functionally equivalent to the OpenAI SDK's native `Callable[[], str]` contract but adds one indirection layer. If the Anthropic SDK adds first-class callable-auth support in a future release, Hermes will switch to it transparently.
+- **Batch jobs and `multiprocessing.Pool`.** The Entra token provider is a closure that cannot be pickled across process boundaries. `batch_runner.py` automatically drops the callable from the worker config and lets each worker process rebuild its own provider from `config.yaml` — no user action required, but each worker pays one chain walk at startup.
+- **No bearer JWT persistence in `auth.json`.** Hermes does not duplicate `azure-identity`'s internal token cache; cold starts walk the credential chain on first inference.
 
 ## Configuration (written to `config.yaml`)
 
@@ -126,9 +267,18 @@ You can always type a deployment name directly — Hermes does not validate agai
 
 | Variable | Purpose |
 |----------|---------|
-| `AZURE_FOUNDRY_API_KEY` | Primary API key for Azure AI Foundry / Azure OpenAI |
+| `AZURE_FOUNDRY_API_KEY` | Primary API key for Azure AI Foundry / Azure OpenAI (api_key mode) |
 | `AZURE_FOUNDRY_BASE_URL` | Endpoint URL (set via `hermes model`; env var is used as a fallback) |
 | `AZURE_ANTHROPIC_KEY` | Used by `provider: anthropic` + Azure base URL (alternative to `ANTHROPIC_API_KEY`) |
+| `AZURE_TENANT_ID` | Entra ID tenant for service-principal flows |
+| `AZURE_CLIENT_ID` | Entra ID client ID (service principal or user-assigned MI) |
+| `AZURE_CLIENT_SECRET` | Service principal secret |
+| `AZURE_CLIENT_CERTIFICATE_PATH` | Service principal cert (alternative to secret) |
+| `AZURE_FEDERATED_TOKEN_FILE` | Workload Identity federated token path (AKS) |
+| `AZURE_AUTHORITY_HOST` | Sovereign cloud authority host override |
+| `IDENTITY_ENDPOINT` / `MSI_ENDPOINT` | Managed Identity endpoint (set automatically by Azure-hosted compute) |
+
+The Azure SDK reads the `AZURE_*` env vars directly. Hermes never inspects them other than to report which sources are present in `hermes doctor` output.
 
 ## Troubleshooting
 
@@ -150,8 +300,21 @@ model:
   api_mode: anthropic_messages   # or chat_completions
 ```
 
+**Entra ID: "credential chain exhausted" or 401 Unauthorized after switching to `auth_mode: entra_id`.**
+- Run `az login` to refresh your developer session (the cached token may have expired).
+- Verify the `Cognitive Services User` role assignment took effect: `az role assignment list --assignee <user-or-mi-id>` should list it on your Foundry resource. Role propagation can take up to 5 minutes.
+- For user-assigned managed identities, double-check `model.entra.client_id` matches the identity attached to the VM.
+- Run `hermes doctor` — the Azure Entra probe reports which credential class succeeded (or which failed first) and includes a remediation hint.
+
+**Entra ID: wizard preflight hangs or times out.**
+The 10 s preflight is a soft check. Choose "Save anyway and validate later" and run `hermes doctor` after deploying to the target environment. Common cause: `DefaultAzureCredential` is probing IMDS (169.254.169.254) on a laptop that isn't on an Azure VM — set `AZURE_TENANT_ID`+`AZURE_CLIENT_ID`+`AZURE_CLIENT_SECRET` (service principal) or run `az login` to skip the IMDS probe.
+
+**401 on Anthropic-style endpoint with Entra ID.**
+Verify the same `Cognitive Services User` role is assigned on the Foundry resource (it covers both `/openai/v1` and `/anthropic` paths). If the OpenAI-style probe works during the wizard but `claude-*` requests fail at runtime, the most common cause is a stale `model.entra.scope` left over from an earlier wizard run — delete the `entra.scope` line from `config.yaml` so the runtime falls back to the default `https://ai.azure.com/.default` scope.
+
 ## Related
 
 - [Environment variables](/docs/reference/environment-variables)
 - [Configuration](/docs/user-guide/configuration)
 - [AWS Bedrock](/docs/guides/aws-bedrock) — the other major cloud provider integration
+- [Microsoft: Configure Entra ID for Foundry](https://learn.microsoft.com/azure/ai-foundry/foundry-models/how-to/configure-entra-id) — upstream documentation for the keyless path

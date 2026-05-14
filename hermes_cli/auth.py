@@ -4108,6 +4108,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_minimax_oauth_auth_status()
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
+    if target == "azure-foundry":
+        return _get_azure_foundry_auth_status()
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":
@@ -4120,6 +4122,67 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         except ImportError:
             return {"logged_in": False, "provider": target, "error": "boto3 not installed"}
     return {"logged_in": False}
+
+
+def _get_azure_foundry_auth_status() -> Dict[str, Any]:
+    """Return structural auth status for Azure Foundry.
+
+    Returns ``logged_in=True`` when:
+
+      * ``auth_mode == "entra_id"`` AND ``azure-identity`` is importable
+        (we do NOT mint a token here — that's an expensive ``get_token()``
+        call. ``hermes doctor`` runs the live probe).
+      * ``auth_mode == "api_key"`` (default) AND ``AZURE_FOUNDRY_API_KEY``
+        is set with a usable value.
+
+    Never invokes the Entra credential chain — keeps CLI startup latency
+    flat regardless of IMDS / az login state.
+    """
+    info: Dict[str, Any] = {"provider": "azure-foundry"}
+    try:
+        from hermes_cli.config import load_config, get_env_value
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+
+    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+    auth_mode = "api_key"
+    base_url = ""
+    if isinstance(model_cfg, dict):
+        auth_mode = str(model_cfg.get("auth_mode") or "api_key").strip().lower() or "api_key"
+        base_url = str(model_cfg.get("base_url") or "").strip()
+    info["auth_mode"] = auth_mode
+    info["base_url"] = base_url
+
+    if auth_mode == "entra_id":
+        try:
+            from agent.azure_identity_adapter import (
+                SCOPE_AI_AZURE_DEFAULT,
+                has_azure_identity_installed,
+            )
+            installed = has_azure_identity_installed()
+            info["azure_identity_installed"] = installed
+            info["scope"] = SCOPE_AI_AZURE_DEFAULT
+            info["logged_in"] = bool(installed)
+            if not installed:
+                info["hint"] = (
+                    "azure-identity not installed. Install with: "
+                    "pip install azure-identity  (or rely on Hermes' "
+                    "lazy-install at first use)."
+                )
+            return info
+        except Exception as exc:
+            info["logged_in"] = False
+            info["error"] = f"azure-identity check failed: {exc}"
+            return info
+
+    # api_key mode (default)
+    try:
+        api_key = get_env_value("AZURE_FOUNDRY_API_KEY") or os.getenv("AZURE_FOUNDRY_API_KEY", "")
+    except Exception:
+        api_key = os.getenv("AZURE_FOUNDRY_API_KEY", "")
+    info["logged_in"] = has_usable_secret(api_key)
+    return info
 
 
 def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:

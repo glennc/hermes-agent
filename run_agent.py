@@ -1607,7 +1607,16 @@ class AIAgent:
                 self._client_kwargs = {}
                 if not self.quiet_mode:
                     print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
-                    if effective_key and len(effective_key) > 12:
+                    # ``effective_key`` may be a callable Entra ID bearer
+                    # provider for Azure Foundry anthropic_messages mode.
+                    # The Anthropic adapter installs an httpx event hook
+                    # that mints a fresh JWT per request — we never
+                    # invoke or inspect the callable in the banner.
+                    from agent.azure_identity_adapter import is_token_provider
+
+                    if is_token_provider(effective_key):
+                        print("🔑 Using credentials: Microsoft Entra ID")
+                    elif isinstance(effective_key, str) and len(effective_key) > 12:
                         print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
         elif self.api_mode == "bedrock_converse":
             # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
@@ -1799,12 +1808,19 @@ class AIAgent:
                     print(f"🤖 AI Agent initialized with model: {self.model}")
                     if base_url:
                         print(f"🔗 Using custom base URL: {base_url}")
-                    # Always show API key info (masked) for debugging auth issues
+                    # ``api_key`` may be a callable Entra ID bearer
+                    # provider (Azure Foundry). The OpenAI SDK mints a
+                    # fresh JWT per request internally — the banner
+                    # never invokes or inspects the callable.
+                    from agent.azure_identity_adapter import is_token_provider
+
                     key_used = client_kwargs.get("api_key", "none")
-                    if key_used and key_used != "dummy-key" and len(key_used) > 12:
+                    if is_token_provider(key_used):
+                        print("🔑 Using credentials: Microsoft Entra ID")
+                    elif isinstance(key_used, str) and key_used and key_used != "dummy-key" and len(key_used) > 12:
                         print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
                     else:
-                        print(f"⚠️  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
+                        print("⚠️  Warning: API key appears invalid or missing")
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
         
@@ -2430,7 +2446,12 @@ class AIAgent:
                 logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
         if self._ollama_num_ctx is None and self.base_url and is_local_endpoint(self.base_url):
             try:
-                _detected = query_ollama_num_ctx(self.model, self.base_url, api_key=self.api_key or "")
+                # ``self.api_key`` may be a callable (Entra token provider).
+                # Ollama detection makes a manual HTTP request and expects a
+                # string — Azure Foundry isn't a local endpoint so this branch
+                # never fires for Entra, but guard defensively.
+                _key_for_ollama = self.api_key if isinstance(self.api_key, str) else ""
+                _detected = query_ollama_num_ctx(self.model, self.base_url, api_key=_key_for_ollama or "")
                 if _detected and _detected > 0:
                     self._ollama_num_ctx = _detected
             except Exception as exc:
@@ -2734,10 +2755,16 @@ class AIAgent:
                 _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
             except Exception:
                 _sm_custom_providers = None
+            # ``self.api_key`` may be a callable (Azure Foundry Entra ID
+            # token provider). ``get_model_context_length`` expects a
+            # string for its live-probe paths; for Foundry the context
+            # length normally resolves via config or static catalogs and
+            # never hits a probe, but coerce to empty string defensively.
+            _ctx_api_key = self.api_key if isinstance(self.api_key, str) else ""
             new_context_length = get_model_context_length(
                 self.model,
                 base_url=self.base_url,
-                api_key=self.api_key,
+                api_key=_ctx_api_key,
                 provider=self.provider,
                 config_context_length=getattr(self, "_config_context_length", None),
                 custom_providers=_sm_custom_providers,
@@ -2746,7 +2773,7 @@ class AIAgent:
                 model=self.model,
                 context_length=new_context_length,
                 base_url=self.base_url,
-                api_key=getattr(self, "api_key", ""),
+                api_key=self.api_key,  # context_compressor forwards to call_llm; callable preserved
                 provider=self.provider,
                 api_mode=self.api_mode,
             )
@@ -3239,7 +3266,15 @@ class AIAgent:
                 return
 
             aux_base_url = str(getattr(client, "base_url", ""))
-            aux_api_key = str(getattr(client, "api_key", ""))
+            # ``client.api_key`` may be a callable (Azure Foundry Entra ID
+            # bearer provider). The context-length resolver chain expects a
+            # string, but it only needs a key for live catalogue probes
+            # (provider model lists). For Entra clients the model-metadata
+            # chain still resolves via models.dev + hardcoded family
+            # fallbacks, which don't require auth — pass empty string rather
+            # than minting a bearer JWT just to look up a context length.
+            _raw_aux_key = getattr(client, "api_key", "")
+            aux_api_key = "" if (callable(_raw_aux_key) and not isinstance(_raw_aux_key, str)) else str(_raw_aux_key or "")
 
             aux_context = get_model_context_length(
                 aux_model,
@@ -4994,7 +5029,11 @@ class AIAgent:
         prefix = f"HTTP {status_code}: " if status_code else ""
         return f"{prefix}{raw[:500]}"
 
-    def _mask_api_key_for_logs(self, key: Optional[str]) -> Optional[str]:
+    def _mask_api_key_for_logs(self, key: Any) -> Optional[str]:
+        # Azure Foundry Entra ID bearer providers are callables — never
+        # invoke them in log paths; identify the auth surface instead.
+        if callable(key) and not isinstance(key, str):
+            return "<entra-id-bearer>"
         if not key:
             return None
         if len(key) <= 12:
@@ -8899,16 +8938,21 @@ class AIAgent:
             # the fallback activation drops to 128K even when config says 204800.
             if hasattr(self, 'context_compressor') and self.context_compressor:
                 from agent.model_metadata import get_model_context_length
+                # ``self.api_key`` may be callable (Entra ID); the
+                # context-length resolver expects a string for live
+                # probes. Foundry typically resolves via config/static
+                # catalogs anyway, so coerce defensively.
+                _fb_ctx_api_key = self.api_key if isinstance(self.api_key, str) else ""
                 fb_context_length = get_model_context_length(
                     self.model, base_url=self.base_url,
-                    api_key=self.api_key, provider=self.provider,
+                    api_key=_fb_ctx_api_key, provider=self.provider,
                     config_context_length=getattr(self, "_config_context_length", None),
                 )
                 self.context_compressor.update_model(
                     model=self.model,
                     context_length=fb_context_length,
                     base_url=self.base_url,
-                    api_key=getattr(self, "api_key", ""),
+                    api_key=getattr(self, "api_key", ""),  # callable preserved → call_llm
                     provider=self.provider,
                 )
 
@@ -13484,7 +13528,11 @@ class AIAgent:
                             # that survives message/tool sanitization (#6843).
                             _credential_sanitized = False
                             _raw_key = getattr(self, "api_key", None) or ""
-                            if _raw_key:
+                            # Entra-ID bearer providers are callables — their
+                            # minted JWTs are always ASCII, so no sanitization
+                            # is needed (and ``_strip_non_ascii`` would crash
+                            # on a callable input).
+                            if _raw_key and isinstance(_raw_key, str):
                                 _clean_key = _strip_non_ascii(_raw_key)
                                 if _clean_key != _raw_key:
                                     self.api_key = _clean_key
@@ -13756,15 +13804,26 @@ class AIAgent:
                     ):
                         anthropic_auth_retry_attempted = True
                         from agent.anthropic_adapter import _is_oauth_token
+                        from agent.azure_identity_adapter import is_token_provider
                         if self._try_refresh_anthropic_client_credentials():
                             print(f"{self.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
                             continue
                         # Credential refresh didn't help — show diagnostic info
                         key = self._anthropic_api_key
-                        auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
                         print(f"{self.log_prefix}🔐 Anthropic 401 — authentication failed.")
-                        print(f"{self.log_prefix}   Auth method: {auth_method}")
-                        print(f"{self.log_prefix}   Token prefix: {key[:12]}..." if key and len(key) > 12 else f"{self.log_prefix}   Token: (empty or short)")
+                        if is_token_provider(key):
+                            # Azure Foundry Entra ID — the bearer token is
+                            # minted per-request by an httpx event hook on a
+                            # custom http_client passed to the SDK. The 401
+                            # means Azure rejected the JWT (RBAC role missing,
+                            # az login expired, IMDS unreachable, etc.).
+                            print(f"{self.log_prefix}   Auth method: Microsoft Entra ID (httpx event hook)")
+                            print(f"{self.log_prefix}   Run `hermes doctor` for credential-chain diagnostics, or")
+                            print(f"{self.log_prefix}   `az login` if your developer session expired.")
+                        else:
+                            auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
+                            print(f"{self.log_prefix}   Auth method: {auth_method}")
+                            print(f"{self.log_prefix}   Token prefix: {key[:12]}..." if isinstance(key, str) and len(key) > 12 else f"{self.log_prefix}   Token: (empty or short)")
                         print(f"{self.log_prefix}   Troubleshooting:")
                         from hermes_constants import display_hermes_home as _dhh_fn
                         _dhh = _dhh_fn()
