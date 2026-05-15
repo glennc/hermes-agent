@@ -81,7 +81,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "provider.anthropic": ("anthropic==0.86.0",),
     # AWS Bedrock provider
     "provider.bedrock": ("boto3==1.42.89",),
-    # Azure AI Foundry — Entra ID auth (managed identity, workload identity,
+    # Microsoft Foundry — Entra ID auth (managed identity, workload identity,
     # service principal, az login, VS Code, azd, PowerShell). Only loaded
     # when model.auth_mode=entra_id is selected; key-based azure-foundry
     # users never pay this import.

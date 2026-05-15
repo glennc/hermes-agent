@@ -1,6 +1,6 @@
 """Azure Foundry endpoint auto-detection.
 
-Inspect an Azure AI Foundry / Azure OpenAI endpoint to determine:
+Inspect a Microsoft Foundry / Azure OpenAI endpoint to determine:
   - API transport (OpenAI-style ``chat_completions`` vs
     Anthropic-style ``anthropic_messages``)
   - Available models (best effort — Azure does not expose a deployment
@@ -376,6 +376,9 @@ def lookup_context_length(model: str,
     only reads catalog metadata over HTTP — no SDK client is built — so
     the minted token is consumed for at most one /models probe.
     """
+    model_id = str(model or "").strip()
+    if not model_id:
+        return None
     try:
         from agent.model_metadata import (
             DEFAULT_FALLBACK_CONTEXT,
@@ -387,10 +390,10 @@ def lookup_context_length(model: str,
     # Resolve the credential once. For Entra mode this calls the token
     # provider; for legacy api_key this is a no-op string pass-through.
     token, mode = _resolve_credential(api_key, token_provider)
-    effective_key = token if mode == "entra_id" else (token or "")
+    effective_key = token or ""
 
     try:
-        n = get_model_context_length(model, base_url=base_url, api_key=effective_key)
+        n = get_model_context_length(model_id, base_url=base_url, api_key=effective_key)
     except Exception as exc:
         logger.debug("azure_detect: context length lookup failed: %s", exc)
         return None

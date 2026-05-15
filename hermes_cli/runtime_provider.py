@@ -837,10 +837,6 @@ def _resolve_azure_foundry_runtime(
             try:
                 entra_config = EntraIdentityConfig(
                     scope=scope,
-                    client_id=(str(cfg_entra.get("client_id") or "").strip() or None),
-                    exclude_interactive_browser=bool(
-                        cfg_entra.get("exclude_interactive_browser", True)
-                    ),
                 )
                 token_provider = build_token_provider(config=entra_config)
             except ImportError as exc:
@@ -849,13 +845,19 @@ def _resolve_azure_foundry_runtime(
             source = "entra_id"
             auth_mode = "entra_id"
 
+        clean_entra = {}
+        if auth_mode == "entra_id":
+            configured_scope = str(cfg_entra.get("scope") or "").strip()
+            if configured_scope:
+                clean_entra["scope"] = configured_scope
+
         return {
             "provider": "azure-foundry",
             "api_mode": cfg_api_mode,
             "base_url": base_url,
             "api_key": api_key,
             "auth_mode": auth_mode,
-            "entra": cfg_entra if auth_mode == "entra_id" else {},
+            "entra": clean_entra,
             "source": source,
             "requested_provider": requested_provider,
         }
@@ -1293,7 +1295,7 @@ def resolve_runtime_provider(
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or "https://api.anthropic.com"
 
-        # For Azure AI Foundry endpoints, use ANTHROPIC_API_KEY directly —
+        # For Microsoft Foundry endpoints, use ANTHROPIC_API_KEY directly —
         # Claude Code OAuth tokens (sk-ant-oat01) are not accepted by Azure.
         # Azure keys don't start with "sk-ant-" so resolve_anthropic_token()
         # would find the Claude Code OAuth token first (priority 3) and return

@@ -1,6 +1,6 @@
-"""Microsoft Entra ID adapter for Azure AI Foundry.
+"""Microsoft Entra ID adapter for Microsoft Foundry.
 
-Provides keyless authentication for Azure AI Foundry deployments using the
+Provides keyless authentication for Microsoft Foundry deployments using the
 `azure-identity` SDK's `DefaultAzureCredential` chain (env service principal
 → workload identity → managed identity → VS Code → Azure CLI → azd →
 PowerShell → broker).
@@ -123,24 +123,23 @@ def reset_credential_cache() -> None:
 class EntraIdentityConfig:
     """Serializable Entra ID config.
 
-    Captures the Hermes-managed knobs that ``DefaultAzureCredential``
-    cannot get from environment variables on its own. Everything else
+    Captures the Hermes-managed Entra knobs we need outside Azure SDK
+    environment configuration. Everything else
     (tenant ID, service principal secret, federated token file, sovereign
     cloud authority, etc.) flows through azure-identity's standard
     ``AZURE_*`` env vars — see the Bedrock pattern in
     ``hermes_cli/runtime_provider.py:1310-1377`` for the analogous
     "let the SDK read env" approach.
 
-    Fields kept here:
+    ``scope`` is Microsoft's documented Foundry inference audience. Almost
+    everyone uses the default; sovereign-cloud / non-standard tenants can
+    override via ``model.entra.scope``. Identity selection (user-assigned
+    managed identity, workload identity, service principal, tenant, authority)
+    stays in the standard Azure SDK env vars such as ``AZURE_CLIENT_ID``.
 
-    * ``scope`` — Microsoft's documented Foundry inference audience.
-      Almost everyone uses the default; sovereign-cloud / non-standard
-      tenants override via ``model.entra.scope``. No env-var alternative.
-    * ``client_id`` — the user-assigned managed identity to select.
-      ``ManagedIdentityCredential`` only accepts this as a constructor
-      kwarg; there is no env var that picks a user-assigned MI for it.
-    * ``exclude_interactive_browser`` — defaults to True (no popup in
-      headless / CI runs). Users opt in by setting False.
+    ``exclude_interactive_browser`` is kept as an internal constructor knob
+    so probes stay non-interactive by default. It is not written by the setup
+    wizard.
 
     The dataclass is frozen so it's hashable for ``functools.lru_cache``
     keying, and serializable across multiprocessing boundaries (workers
@@ -148,13 +147,15 @@ class EntraIdentityConfig:
     """
 
     scope: str = SCOPE_AI_AZURE_DEFAULT
-    client_id: Optional[str] = None
     exclude_interactive_browser: bool = True
+
+    def __post_init__(self) -> None:
+        scope = str(self.scope or "").strip() or SCOPE_AI_AZURE_DEFAULT
+        object.__setattr__(self, "scope", scope)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "scope": self.scope,
-            "client_id": self.client_id,
             "exclude_interactive_browser": self.exclude_interactive_browser,
         }
 
@@ -163,11 +164,9 @@ class EntraIdentityConfig:
                   *, default_scope: Optional[str] = None) -> "EntraIdentityConfig":
         data = data or {}
         scope = str(data.get("scope") or "").strip() or default_scope or SCOPE_AI_AZURE_DEFAULT
-        client_id = (str(data.get("client_id") or "").strip() or None)
         exclude_browser = bool(data.get("exclude_interactive_browser", True))
         return cls(
             scope=scope,
-            client_id=client_id,
             exclude_interactive_browser=exclude_browser,
         )
 
@@ -175,7 +174,7 @@ class EntraIdentityConfig:
 def _build_default_credential(config: EntraIdentityConfig) -> Any:
     """Construct a ``DefaultAzureCredential`` for ``config``.
 
-    Only Hermes-specific knobs are passed as kwargs. Everything else
+    Only Hermes-selected knobs are passed as kwargs. Everything else
     (tenant, service principal secret, federated token file, sovereign
     cloud authority, etc.) is read by ``azure-identity`` from the
     standard ``AZURE_*`` environment variables — see Microsoft's
@@ -188,14 +187,6 @@ def _build_default_credential(config: EntraIdentityConfig) -> Any:
     # explicitly opts in to interactive browser auth.
     if not config.exclude_interactive_browser:
         kwargs["exclude_interactive_browser_credential"] = False
-    if config.client_id:
-        # User-assigned managed identity selection has no env-var
-        # equivalent — ``ManagedIdentityCredential`` only accepts
-        # ``client_id`` as a kwarg. Mirror to ``workload_identity_client_id``
-        # so AKS workload-identity setups that pin the identity via
-        # config.yaml rather than the federation file kwarg work too.
-        kwargs["managed_identity_client_id"] = config.client_id
-        kwargs["workload_identity_client_id"] = config.client_id
     return ai.DefaultAzureCredential(**kwargs)
 
 
@@ -225,7 +216,6 @@ def build_token_provider(scope: Optional[str] = None,
                          *,
                          config: Optional[EntraIdentityConfig] = None,
                          base_url: Optional[str] = None,
-                         client_id: Optional[str] = None,
                          exclude_interactive_browser: bool = True,
                          ) -> Callable[[], str]:
     """Return a zero-arg callable that mints a fresh Entra bearer JWT.
@@ -240,8 +230,8 @@ def build_token_provider(scope: Optional[str] = None,
         )
 
     Scope resolution order:
-      1. explicit ``scope`` kwarg
-      2. ``config.scope``
+      1. ``config.scope`` when a config object is supplied
+      2. explicit ``scope`` kwarg
       3. ``SCOPE_AI_AZURE_DEFAULT`` (Microsoft's documented Foundry scope)
 
     ``base_url`` is unused today and kept for back-compat. Tenant /
@@ -255,10 +245,8 @@ def build_token_provider(scope: Optional[str] = None,
     """
     ai = _require_azure_identity()
     if config is None:
-        effective_scope = (scope or "").strip() or SCOPE_AI_AZURE_DEFAULT
         config = EntraIdentityConfig(
-            scope=effective_scope,
-            client_id=(client_id.strip() if client_id else None) or None,
+            scope=scope or SCOPE_AI_AZURE_DEFAULT,
             exclude_interactive_browser=exclude_interactive_browser,
         )
     credential = build_credential(config)
@@ -279,7 +267,7 @@ def has_azure_identity_credentials(scope: Optional[str] = None,
     """Best-effort probe: can `DefaultAzureCredential` mint a token now?
 
     Runs ``credential.get_token(scope)`` under a thread-based timeout so
-    a slow IMDS endpoint can't hang the caller. Returns False on any
+    a slow token service can't hang the caller. Returns False on any
     error — never raises. Use for ``hermes doctor`` /
     ``hermes auth status`` / wizard preflight.
 
@@ -319,7 +307,7 @@ def has_azure_identity_credentials(scope: Optional[str] = None,
     thread.start()
     thread.join(timeout=max(0.01, timeout_seconds))
     if thread.is_alive():
-        logger.debug("Entra credential probe timed out after %ss", timeout_seconds)
+        logger.debug("Entra token service probe timed out after %ss", timeout_seconds)
         return False
     return bool(result.get("ok"))
 
@@ -373,7 +361,6 @@ def describe_active_credential(config: Optional[EntraIdentityConfig] = None,
         config = EntraIdentityConfig(scope=effective_scope, **overrides)
 
     info["scope"] = config.scope
-    info["client_id"] = config.client_id
     # Tenant / authority / service-principal config flow through the
     # standard ``AZURE_*`` env vars; surface them below.
     if os.environ.get("AZURE_TENANT_ID", "").strip():
@@ -408,7 +395,7 @@ def describe_active_credential(config: Optional[EntraIdentityConfig] = None,
     if thread.is_alive():
         info["error"] = f"Token probe timed out after {timeout_seconds:.0f}s"
         info["hint"] = (
-            "DefaultAzureCredential can be slow when IMDS is unreachable "
+            "DefaultAzureCredential can be slow when the token service is unreachable "
             "or when az login state is stale. Try `az login` or set "
             "AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CLIENT_SECRET."
         )
@@ -512,7 +499,7 @@ def build_bearer_http_client(token_provider: Callable[[], str], **httpx_kwargs: 
         import httpx
     except ImportError as exc:  # pragma: no cover — httpx ships with openai/anthropic
         raise ImportError(
-            "httpx is required for Entra ID bearer auth on Azure Foundry "
+            "httpx is required for Entra ID bearer auth on Microsoft Foundry "
             "Anthropic-style endpoints. It is normally a transitive "
             "dependency of the openai/anthropic SDKs."
         ) from exc
@@ -521,7 +508,7 @@ def build_bearer_http_client(token_provider: Callable[[], str], **httpx_kwargs: 
         try:
             token = materialize_bearer_for_http(token_provider)
         except ValueError as exc:
-            # Token provider failed (chain exhausted, IMDS unreachable,
+            # Token provider failed (chain exhausted, token service unreachable,
             # az login expired, etc.). Strip any auth headers the SDK
             # may have set — including our own placeholder sentinel
             # ``entra-id-bearer-via-http-hook`` from

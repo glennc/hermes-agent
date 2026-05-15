@@ -4093,7 +4093,9 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
 
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
-    target = provider_id or get_active_provider()
+    target = (provider_id or get_active_provider() or "").strip().lower()
+    if not target:
+        return {"logged_in": False}
     if target == "spotify":
         return get_spotify_auth_status()
     if target == "nous":
@@ -4127,16 +4129,17 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
 def _get_azure_foundry_auth_status() -> Dict[str, Any]:
     """Return structural auth status for Azure Foundry.
 
-    Returns ``logged_in=True`` when:
+    ``logged_in`` is structural, matching other non-OAuth provider status
+    checks:
 
       * ``auth_mode == "entra_id"`` AND ``azure-identity`` is importable
-        (we do NOT mint a token here — that's an expensive ``get_token()``
-        call. ``hermes doctor`` runs the live probe).
+        (we do NOT mint a token here; ``hermes doctor`` runs the live
+        probe and reports whether the credential chain can acquire one).
       * ``auth_mode == "api_key"`` (default) AND ``AZURE_FOUNDRY_API_KEY``
         is set with a usable value.
 
     Never invokes the Entra credential chain — keeps CLI startup latency
-    flat regardless of IMDS / az login state.
+    flat regardless of token-service / az login state.
     """
     info: Dict[str, Any] = {"provider": "azure-foundry"}
     try:
@@ -4157,18 +4160,33 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
     if auth_mode == "entra_id":
         try:
             from agent.azure_identity_adapter import (
+                EntraIdentityConfig,
                 SCOPE_AI_AZURE_DEFAULT,
                 has_azure_identity_installed,
             )
             installed = has_azure_identity_installed()
+            entra_cfg = {}
+            if isinstance(model_cfg, dict) and isinstance(model_cfg.get("entra"), dict):
+                entra_cfg = model_cfg["entra"]
+            identity_config = EntraIdentityConfig.from_dict(
+                entra_cfg,
+                default_scope=SCOPE_AI_AZURE_DEFAULT,
+            )
             info["azure_identity_installed"] = installed
-            info["scope"] = SCOPE_AI_AZURE_DEFAULT
+            info["scope"] = identity_config.scope
+            info["credential_probe"] = "not_run"
+            info["credential_verified"] = False
             info["logged_in"] = bool(installed)
             if not installed:
                 info["hint"] = (
                     "azure-identity not installed. Install with: "
                     "pip install azure-identity  (or rely on Hermes' "
                     "lazy-install at first use)."
+                )
+            else:
+                info["hint"] = (
+                    "azure-identity is installed; live credential validation "
+                    "is skipped here. Run `hermes doctor` to verify token acquisition."
                 )
             return info
         except Exception as exc:

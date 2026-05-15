@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -164,7 +165,8 @@ class TestTruncateTokenCallable:
             invoked["count"] += 1
             return "should-not-appear-in-ui"
 
-        rendered = _truncate_token(provider)
+        token_provider = cast(str | None, provider)
+        rendered = _truncate_token(token_provider)
         assert rendered == "<entra-id-bearer>"
         assert invoked["count"] == 0
 

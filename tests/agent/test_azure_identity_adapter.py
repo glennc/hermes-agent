@@ -20,7 +20,9 @@ real Azure endpoint. Tests must remain hermetic per AGENTS.md.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -209,9 +211,9 @@ class TestBuildBearerHttpClient:
     def test_rejects_non_callable_provider(self):
         from agent.azure_identity_adapter import build_bearer_http_client
         with pytest.raises(ValueError):
-            build_bearer_http_client("plain-string-not-callable")
+            build_bearer_http_client(cast(Callable[[], str], "plain-string-not-callable"))
         with pytest.raises(ValueError):
-            build_bearer_http_client(None)
+            build_bearer_http_client(cast(Callable[[], str], None))
 
     def test_forwards_httpx_kwargs(self):
         import httpx
@@ -253,7 +255,6 @@ class TestEntraIdentityConfig:
         from agent.azure_identity_adapter import EntraIdentityConfig
         cfg = EntraIdentityConfig(
             scope="https://ai.azure.com/.default",
-            client_id="client-uuid",
             exclude_interactive_browser=False,
         )
         rebuilt = EntraIdentityConfig.from_dict(cfg.to_dict())
@@ -265,13 +266,12 @@ class TestEntraIdentityConfig:
             "scope": "",
             "client_id": None,
         })
-        assert cfg.client_id is None
         # Empty scope falls back to default
         assert cfg.scope.endswith("/.default")
 
-    def test_from_dict_ignores_legacy_tenant_authority_keys(self):
-        """Old config.yaml that still has model.entra.tenant_id /
-        model.entra.authority should not crash from_dict — those values
+    def test_from_dict_ignores_legacy_identity_keys(self):
+        """Old config.yaml that still has model.entra.client_id /
+        tenant_id / authority should not crash from_dict — those values
         are now read from AZURE_* env vars by azure-identity directly."""
         from agent.azure_identity_adapter import EntraIdentityConfig
         cfg = EntraIdentityConfig.from_dict({
@@ -279,10 +279,15 @@ class TestEntraIdentityConfig:
             "authority": "https://login.partner.microsoftonline.cn",
             "client_id": "user-mi-client",
         })
-        assert cfg.client_id == "user-mi-client"
         # Legacy keys silently ignored — no crash, no surprise field on the dataclass.
+        assert not hasattr(cfg, "client_id")
         assert not hasattr(cfg, "tenant_id")
         assert not hasattr(cfg, "authority")
+
+    def test_constructor_normalizes_empty_scope(self):
+        from agent.azure_identity_adapter import EntraIdentityConfig
+        cfg = EntraIdentityConfig(scope="")
+        assert cfg.scope.endswith("/.default")
 
     def test_from_dict_default_scope_override(self):
         from agent.azure_identity_adapter import EntraIdentityConfig
@@ -297,7 +302,7 @@ class TestEntraIdentityConfig:
         from agent.azure_identity_adapter import EntraIdentityConfig
         cfg = EntraIdentityConfig()
         with pytest.raises((AttributeError, Exception)):
-            cfg.scope = "mutated"  # type: ignore[misc]
+            setattr(cfg, "scope", "mutated")
 
 
 # ---------------------------------------------------------------------------
@@ -367,19 +372,6 @@ class TestBuildCredential:
         # defaults plus env-var-driven settings.
         assert kwargs == {}
         assert cred is not None
-
-    def test_client_id_propagates_to_managed_and_workload(self, fake_azure_identity):
-        """User-assigned managed identity selection has no env-var
-        equivalent (``ManagedIdentityCredential`` only takes ``client_id``
-        as a kwarg), so ``model.entra.client_id`` MUST flow through to
-        the SDK constructor. Mirror to ``workload_identity_client_id``
-        so AKS workload-identity setups that pin the identity via
-        config.yaml work too."""
-        from agent.azure_identity_adapter import EntraIdentityConfig, build_credential
-        build_credential(EntraIdentityConfig(client_id="my-managed-id"))
-        kwargs = fake_azure_identity.last_credential_kwargs
-        assert kwargs["managed_identity_client_id"] == "my-managed-id"
-        assert kwargs["workload_identity_client_id"] == "my-managed-id"
 
     def test_interactive_browser_opt_in(self, fake_azure_identity):
         """When the user explicitly sets
@@ -452,10 +444,10 @@ class TestBuildTokenProvider:
             EntraIdentityConfig,
             build_token_provider,
         )
-        cfg = EntraIdentityConfig(scope="cfg-scope", client_id="cfg-client")
+        cfg = EntraIdentityConfig(scope="cfg-scope")
         build_token_provider(scope="ignored", config=cfg)
         assert fake_azure_identity.last_scope == "cfg-scope"
-        assert fake_azure_identity.last_credential_kwargs["managed_identity_client_id"] == "cfg-client"
+        assert fake_azure_identity.last_credential_kwargs == {}
 
 
 # ---------------------------------------------------------------------------

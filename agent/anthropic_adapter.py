@@ -17,6 +17,7 @@ import os
 import platform
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
@@ -364,7 +365,7 @@ def _normalize_base_url_text(base_url) -> str:
 def _is_third_party_anthropic_endpoint(base_url: str | None) -> bool:
     """Return True for non-Anthropic endpoints using the Anthropic Messages API.
 
-    Third-party proxies (Azure AI Foundry, AWS Bedrock, self-hosted) authenticate
+    Third-party proxies (Microsoft Foundry, AWS Bedrock, self-hosted) authenticate
     with their own API keys via x-api-key, not Anthropic OAuth tokens. OAuth
     detection should be skipped for these endpoints.
     """
@@ -489,6 +490,24 @@ def _base_url_needs_context_1m_beta(base_url: str | None) -> bool:
     return "azure.com" in normalized
 
 
+def _is_azure_anthropic_endpoint(base_url: str | None) -> bool:
+    """Return True for Azure-hosted Anthropic Messages endpoints.
+
+    This intentionally avoids a finite allow-list of Foundry host suffixes;
+    instead it requires the Foundry ``services.ai.azure`` host family and
+    an Anthropic route. That keeps unrelated Azure services from receiving
+    Anthropic-specific query/header tweaks without assuming we know every
+    sovereign/private top-level suffix.
+    """
+    normalized = _normalize_base_url_text(base_url)
+    if not normalized:
+        return False
+    parsed = urlparse(normalized)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    path = (parsed.path or "").lower()
+    return ".services.ai.azure." in f".{host}." and "/anthropic" in path
+
+
 def _common_betas_for_base_url(
     base_url: str | None,
     *,
@@ -502,7 +521,7 @@ def _common_betas_for_base_url(
 
     The ``context-1m-2025-08-07`` beta is not sent to native Anthropic by
     default because some subscriptions reject it. Add it only for endpoint
-    families that still require it for 1M context, currently Azure AI Foundry.
+    families that still require it for 1M context, currently Microsoft Foundry.
     Bedrock uses its own client helper below and opts in explicitly.
 
     ``drop_context_1m_beta=True`` strips the 1M-context beta from any path that
@@ -576,8 +595,7 @@ def _build_anthropic_client_with_bearer_hook(
     }
 
     if normalized_base_url:
-        is_azure = "azure.com" in normalized_base_url.lower()
-        if is_azure and "api-version" not in normalized_base_url:
+        if _is_azure_anthropic_endpoint(normalized_base_url) and "api-version" not in normalized_base_url:
             kwargs["base_url"] = normalized_base_url
             kwargs["default_query"] = {"api-version": "2025-04-15"}
         else:
@@ -656,8 +674,7 @@ def build_anthropic_client(
         # Pass it via default_query so the SDK appends it to every request URL
         # without corrupting the base_url (appending it directly produces
         # malformed paths like /anthropic?api-version=.../v1/messages).
-        _is_azure_endpoint = "azure.com" in normalized_base_url.lower()
-        if _is_azure_endpoint and "api-version" not in normalized_base_url:
+        if _is_azure_anthropic_endpoint(normalized_base_url) and "api-version" not in normalized_base_url:
             kwargs["base_url"] = normalized_base_url.rstrip("/")
             kwargs["default_query"] = {"api-version": "2025-04-15"}
         else:
@@ -687,7 +704,7 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_third_party_anthropic_endpoint(base_url):
-        # Third-party proxies (Azure AI Foundry, AWS Bedrock, etc.) use their
+        # Third-party proxies (Microsoft Foundry, AWS Bedrock, etc.) use their
         # own API keys with x-api-key auth. Skip OAuth detection — their keys
         # don't follow Anthropic's sk-ant-* prefix convention and would be
         # misclassified as OAuth tokens.
@@ -1822,7 +1839,7 @@ def convert_messages_to_anthropic(
     # causing HTTP 400 "Invalid signature in thinking block".
     #
     # Signatures are Anthropic-proprietary.  Third-party endpoints
-    # (MiniMax, Azure AI Foundry, self-hosted proxies) cannot validate
+    # (MiniMax, Microsoft Foundry, self-hosted proxies) cannot validate
     # them and will reject them outright.  When targeting a third-party
     # endpoint, strip ALL thinking/redacted_thinking blocks from every
     # assistant message — the third-party will generate its own
@@ -2168,5 +2185,3 @@ def build_anthropic_kwargs(
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
-
-

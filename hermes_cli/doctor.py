@@ -1541,11 +1541,11 @@ def run_doctor(args):
 
         Skipped unless the active config has ``model.provider:
         azure-foundry`` AND ``model.auth_mode: entra_id`` — we don't probe
-        the IMDS/CLI chain for users on plain API-key Azure.
+        the token-service / CLI chain for users on plain API-key Azure.
 
         Bounded by a 10s timeout (via
         :func:`agent.azure_identity_adapter.describe_active_credential`)
-        so a slow IMDS endpoint can't pad the doctor run.
+        so a slow token service can't pad the doctor run.
         """
         label = "Azure Foundry (Entra ID)".ljust(28)
         try:
@@ -1594,10 +1594,6 @@ def run_doctor(args):
         )
         config = EntraIdentityConfig(
             scope=scope,
-            client_id=(str(entra_cfg.get("client_id") or "").strip() or None),
-            exclude_interactive_browser=bool(
-                entra_cfg.get("exclude_interactive_browser", True)
-            ),
         )
         info = describe_active_credential(config=config, timeout_seconds=10.0)
         if info.get("ok"):

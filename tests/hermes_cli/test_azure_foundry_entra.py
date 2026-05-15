@@ -5,13 +5,14 @@ Covers the contract introduced in PR for Microsoft Entra ID auth on
 
   * ``_resolve_azure_foundry_runtime`` returns a callable ``api_key`` for
     ``model.auth_mode = entra_id`` (OpenAI-style only).
-  * Anthropic-style endpoints with ``auth_mode = entra_id`` raise a clear
-    AuthError pointing at the docs.
+  * Anthropic-style endpoints with ``auth_mode = entra_id`` return the same
+    callable runtime credential as OpenAI-style endpoints.
   * The legacy ``api_key`` path is unchanged when ``auth_mode`` is absent
     or set to ``api_key``.
   * Explicit ``--api-key`` overrides at runtime still work in entra mode
     (escape hatch for one-off testing).
-  * ``model.entra.*`` fields propagate to the token-provider config.
+  * ``model.entra.scope`` propagates to the token-provider config; Azure
+    identity selection stays in standard AZURE_* env vars.
   * ``_get_azure_foundry_auth_status`` is structural — never mints a
     token (verified by checking the credential cache untouched).
   * ``has_usable_secret`` for ``AZURE_FOUNDRY_API_KEY`` is irrelevant
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -54,7 +56,7 @@ def fake_azure_identity(monkeypatch):
         get_bearer_token_provider=lambda credential, scope: (
             last.__setitem__("scope", scope),
             last.__setitem__("kwargs", credential.kwargs),
-            last.__setitem__("credential_count", last["credential_count"] + 1),
+            last.__setitem__("credential_count", cast(int, last["credential_count"]) + 1),
             _provider(scope),
         )[-1],
     )
@@ -108,12 +110,12 @@ class TestResolveAzureFoundryRuntimeEntra:
         assert callable(runtime["api_key"])
         assert runtime["auth_mode"] == "entra_id"
 
-    def test_entra_propagates_scope_and_client_id(self, fake_azure_identity):
-        """``model.entra.scope`` and ``model.entra.client_id`` are the
-        only Hermes-managed kwargs — everything else (tenant, authority,
+    def test_entra_propagates_scope_only(self, fake_azure_identity):
+        """``model.entra.scope`` is the only Hermes-managed Azure SDK
+        setting. Identity selection (client ID, tenant, authority,
         service principal secret, federated token file) flows through
         standard ``AZURE_*`` env vars read by azure-identity directly.
-        Legacy ``model.entra.tenant_id`` / ``model.entra.authority``
+        Legacy ``model.entra.client_id`` / ``tenant_id`` / ``authority``
         keys in config.yaml are silently ignored."""
         from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
         _resolve_azure_foundry_runtime(
@@ -135,8 +137,8 @@ class TestResolveAzureFoundryRuntimeEntra:
         )
         assert fake_azure_identity["scope"] == "https://custom.example/.default"
         kw = fake_azure_identity["kwargs"]
-        assert kw["managed_identity_client_id"] == "client-uuid"
-        assert kw["workload_identity_client_id"] == "client-uuid"
+        assert "managed_identity_client_id" not in kw
+        assert "workload_identity_client_id" not in kw
         assert "interactive_browser_tenant_id" not in kw
         assert "authority" not in kw
 
@@ -228,7 +230,7 @@ class TestResolveAzureFoundryRuntimeEntra:
         assert runtime["auth_mode"] == "api_key"
         assert runtime["source"] == "explicit"
 
-    def test_entra_persists_entra_block_in_runtime_dict(self, fake_azure_identity):
+    def test_entra_runtime_dict_keeps_only_scope_override(self, fake_azure_identity):
         from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
         runtime = _resolve_azure_foundry_runtime(
             requested_provider="azure-foundry",
@@ -237,10 +239,13 @@ class TestResolveAzureFoundryRuntimeEntra:
                 "base_url": "https://r.openai.azure.com/openai/v1",
                 "api_mode": "chat_completions",
                 "auth_mode": "entra_id",
-                "entra": {"client_id": "c"},
+                "entra": {
+                    "scope": "https://custom.example/.default",
+                    "client_id": "legacy-client",
+                },
             },
         )
-        assert runtime["entra"] == {"client_id": "c"}
+        assert runtime["entra"] == {"scope": "https://custom.example/.default"}
 
 
 # ---------------------------------------------------------------------------

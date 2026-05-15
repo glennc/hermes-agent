@@ -572,10 +572,6 @@ def _interactive_auth() -> None:
                 else:
                     _entra_cfg = EntraIdentityConfig(
                         scope=_scope,
-                        client_id=(str(_entra.get("client_id") or "").strip() or None),
-                        exclude_interactive_browser=bool(
-                            _entra.get("exclude_interactive_browser", True)
-                        ),
                     )
                     _info = describe_active_credential(config=_entra_cfg, timeout_seconds=10.0)
                     _env_sources = _info.get("env_sources") or []

@@ -3386,7 +3386,7 @@ def _model_flow_azure_foundry(config, current_model=""):
       ``azure-identity`` SDK (Managed Identity / Workload Identity / az
       login / VS Code / azd / service principal env vars). Works on both
       OpenAI-style and Anthropic-style endpoints — Microsoft RBAC is
-      per-resource and the same ``Cognitive Services User`` role grants
+      per-resource and the same ``Azure AI User`` role grants
       both. For OpenAI-style the OpenAI SDK's native callable
       ``api_key=`` contract is used; for Anthropic-style an
       ``httpx.Client`` with a request event hook (built by
@@ -3484,9 +3484,9 @@ def _model_flow_azure_foundry(config, current_model=""):
     print()
     print("Authentication:")
     print("  1. API key                  (AZURE_FOUNDRY_API_KEY in .env)")
-    print("  2. Microsoft Entra ID       (managed identity / az login / service principal)")
+    print("  2. Microsoft Entra ID       (managed identity / workload identity / az login)")
     print("     Recommended by Microsoft. Works for both OpenAI-style and Anthropic-style endpoints.")
-    print("     Requires the 'Cognitive Services User' role on the Foundry resource.")
+    print("     Requires the 'Azure AI User' role on the Foundry resource.")
     try:
         _auth_default = "2" if current_auth_mode == "entra_id" else "1"
         auth_choice = (
@@ -3531,17 +3531,13 @@ def _model_flow_azure_foundry(config, current_model=""):
                 "run:  pip install azure-identity"
             )
 
-        # Preserve any existing model.entra.* fields verbatim — the user
-        # may have hand-edited them (custom scope, user-assigned MI).
-        # Tenant / authority are read from AZURE_* env vars by
-        # azure-identity directly, not stored in config.yaml.
+        # Preserve only the optional scope override. Identity selection
+        # (tenant, user-assigned MI, workload identity, service principal)
+        # stays in Azure SDK env vars such as AZURE_CLIENT_ID.
         _persisted_scope_override = str(current_entra.get("scope") or "").strip()
-        _persisted_client = str(current_entra.get("client_id") or "").strip()
         entra_scope = _persisted_scope_override or SCOPE_AI_AZURE_DEFAULT
 
         entra_overrides = {}
-        if _persisted_client:
-            entra_overrides["client_id"] = _persisted_client
         if _persisted_scope_override:
             entra_overrides["scope"] = _persisted_scope_override
 
@@ -3549,8 +3545,6 @@ def _model_flow_azure_foundry(config, current_model=""):
         print("◐ Probing Microsoft Entra ID credential chain (up to 10s)...")
         _config = EntraIdentityConfig(
             scope=entra_scope,
-            client_id=(_persisted_client or None),
-            exclude_interactive_browser=True,
         )
         info = describe_active_credential(config=_config, timeout_seconds=10.0)
         if info.get("ok"):
@@ -3702,11 +3696,10 @@ def _model_flow_azure_foundry(config, current_model=""):
     model["default"] = effective_model
     model["auth_mode"] = auth_mode_label
     if use_entra:
-        # Persist only the non-default Entra fields so config.yaml stays
-        # tidy. ``exclude_interactive_browser`` defaults to True in the
-        # adapter; omit unless the user explicitly flipped it.
+        # Persist only the non-default Entra scope so config.yaml stays tidy.
+        # Azure identity selection stays in standard AZURE_* env vars.
         clean_entra: dict = {}
-        for key in ("scope", "tenant_id", "client_id", "authority"):
+        for key in ("scope",):
             val = entra_overrides.get(key)
             if val:
                 clean_entra[key] = val
