@@ -13528,7 +13528,7 @@ class AIAgent:
                             # that survives message/tool sanitization (#6843).
                             _credential_sanitized = False
                             _raw_key = getattr(self, "api_key", None) or ""
-                            # Entra-ID bearer providers are callables — their
+                            # Entra ID bearer providers are callables — their
                             # minted JWTs are always ASCII, so no sanitization
                             # is needed (and ``_strip_non_ascii`` would crash
                             # on a callable input).
