@@ -16,9 +16,16 @@ import signal
 import time
 import traceback
 
-from tui_gateway import server
-from tui_gateway.server import _CRASH_LOG, dispatch, resolve_skin, write_json
+if (os.environ.get("HERMES_TUI_BACKEND") or "").strip().lower() == "foundry":
+    from tui_gateway import foundry_backend as server
+else:
+    from tui_gateway import server
 from tui_gateway.transport import TeeTransport
+
+_CRASH_LOG = server._CRASH_LOG
+dispatch = server.dispatch
+resolve_skin = server.resolve_skin
+write_json = server.write_json
 
 
 def _install_sidecar_publisher() -> None:

@@ -1,4 +1,5 @@
 import atexit
+import base64
 import concurrent.futures
 import contextvars
 import copy
@@ -3712,6 +3713,73 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+
+    bytes_b64 = params.get("bytes_b64")
+    if isinstance(bytes_b64, str) and bytes_b64:
+        # Reject oversize uploads before decode so we do not allocate a large
+        # binary buffer for remote TUI image attach requests.
+        max_image_b64_len = 16 * 1024 * 1024
+        if len(bytes_b64) > max_image_b64_len:
+            return _err(
+                rid,
+                4017,
+                f"image bytes too large: {len(bytes_b64)} bytes base64 "
+                f"(max {max_image_b64_len})",
+            )
+        try:
+            from cli import _IMAGE_EXTENSIONS
+        except Exception as e:
+            return _err(rid, 5027, str(e))
+        try:
+            data = base64.b64decode(bytes_b64, validate=True)
+        except Exception as e:
+            return _err(rid, 4017, f"invalid bytes_b64: {e}")
+        if not data:
+            return _err(rid, 4017, "empty image bytes")
+
+        filename = str(params.get("filename") or "").strip()
+        if filename:
+            filename = Path(filename).name
+        if not filename:
+            session["image_counter"] = session.get("image_counter", 0) + 1
+            filename = (
+                f"tui_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+                f"{session['image_counter']}.png"
+            )
+
+        ext = Path(filename).suffix.lower()
+        if ext not in _IMAGE_EXTENSIONS:
+            return _err(rid, 4016, f"unsupported image: {filename}")
+
+        img_dir = _hermes_home / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        image_path = img_dir / filename
+        if image_path.exists():
+            session["image_counter"] = session.get("image_counter", 0) + 1
+            image_path = (
+                img_dir
+                / f"{image_path.stem}_{session['image_counter']}{ext}"
+            )
+
+        try:
+            image_path.write_bytes(data)
+        except Exception as e:
+            return _err(rid, 5027, f"failed to save image: {e}")
+
+        remainder = str(params.get("remainder") or "")
+        session.setdefault("attached_images", []).append(str(image_path))
+        return _ok(
+            rid,
+            {
+                "attached": True,
+                "path": str(image_path),
+                "count": len(session["attached_images"]),
+                "remainder": remainder,
+                "text": remainder or f"[User attached image: {image_path.name}]",
+                **_image_meta(image_path),
+            },
+        )
+
     raw = str(params.get("path", "") or "").strip()
     if not raw:
         return _err(rid, 4015, "path required")
