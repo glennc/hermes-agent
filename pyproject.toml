@@ -141,6 +141,17 @@ acp = ["agent-client-protocol==0.9.0"]
 mistral = ["mistralai==2.4.8"]
 bedrock = ["boto3==1.42.89"]
 azure-identity = ["azure-identity==1.25.3"]
+observability-otel = [
+  "opentelemetry-api==1.39.1",
+  "opentelemetry-sdk==1.39.1",
+  "opentelemetry-exporter-otlp-proto-grpc==1.39.1",
+  "opentelemetry-exporter-otlp-proto-http==1.39.1",
+]
+observability-azure-monitor = [
+  "opentelemetry-api==1.40.0",
+  "opentelemetry-sdk==1.40.0",
+  "azure-monitor-opentelemetry-exporter==1.0.0b52",
+]
 termux = [
   # Baseline Android / Termux path for reliable fresh installs.
   "python-telegram-bot[webhooks]==22.6",
@@ -217,6 +228,20 @@ all = [
   "hermes-agent[google]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
+]
+
+[tool.uv]
+# Azure Monitor's exporter currently requires OTel 1.40.x, while the generic
+# OTLP extra stays on OTel 1.39.1 so it remains compatible with mistralai 2.4.8.
+conflicts = [
+  [
+    { extra = "mistral" },
+    { extra = "observability-azure-monitor" },
+  ],
+  [
+    { extra = "observability-otel" },
+    { extra = "observability-azure-monitor" },
+  ],
 ]
 
 [project.scripts]

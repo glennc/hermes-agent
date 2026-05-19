@@ -1,0 +1,14 @@
+name: otel
+version: "0.1.0"
+description: "Generic OpenTelemetry observability for Hermes with optional Azure Monitor and Foundry detection."
+author: NousResearch
+hooks:
+  - pre_api_request
+  - post_api_request
+  - pre_llm_call
+  - post_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - on_session_finalize
+  - on_session_end
+  - on_session_reset
