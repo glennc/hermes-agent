@@ -87,6 +87,23 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # users never pay this import.
     "provider.azure_identity": ("azure-identity==1.25.3",),
 
+    # ─── Observability backends ─────────────────────────────────────────────
+    # Generic OpenTelemetry tracing for the bundled observability/otel plugin.
+    "observability.otel": (
+        "opentelemetry-api==1.40.0",
+        "opentelemetry-sdk==1.40.0",
+        "opentelemetry-exporter-otlp-proto-grpc==1.40.0",
+        "opentelemetry-exporter-otlp-proto-http==1.40.0",
+    ),
+    # Azure Monitor exporter for observability/otel.  The exporter currently
+    # pins OTel API/SDK to 1.40.x, so keep these specs aligned with the generic
+    # OTel feature to avoid installing incompatible OTel versions.
+    "observability.azure_monitor": (
+        "opentelemetry-api==1.40.0",
+        "opentelemetry-sdk==1.40.0",
+        "azure-monitor-opentelemetry-exporter==1.0.0b52",
+    ),
+
     # ─── Web search backends ───────────────────────────────────────────────
     "search.exa": ("exa-py==2.10.2",),
     "search.firecrawl": ("firecrawl-py==4.17.0",),

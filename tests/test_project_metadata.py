@@ -73,6 +73,7 @@ def test_lazy_installable_extras_excluded_from_all():
         "modal", "daytona", "vercel",
         "messaging", "slack", "matrix", "dingtalk", "feishu",
         "honcho", "hindsight",
+        "observability-otel", "observability-azure-monitor",
     }
     all_extra_specs = optional_dependencies["all"]
     for extra in lazy_covered_extras:
