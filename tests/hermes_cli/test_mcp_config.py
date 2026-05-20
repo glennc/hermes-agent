@@ -216,6 +216,42 @@ class TestMcpAdd:
         assert "ink" in config.get("mcp_servers", {})
         assert config["mcp_servers"]["ink"]["url"] == "https://mcp.ml.ink/mcp"
 
+    def test_add_http_server_with_entra_auth(self, tmp_path, capsys, monkeypatch):
+        """Entra auth is saved as managed auth and does not prompt for a token."""
+        fake_tools = [FakeTool("search", "Search")]
+
+        def mock_probe(name, config, **kw):
+            assert config["auth"] == "entra_id"
+            assert "headers" not in config
+            return [(t.name, t.description) for t in fake_tools]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        monkeypatch.setattr(
+            "agent.azure_identity_adapter.describe_active_credential",
+            lambda **kwargs: {"ok": True},
+        )
+        inputs = iter([""])  # enable all tools
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+        from hermes_cli.config import read_raw_config
+
+        cmd_mcp_add(_make_args(
+            name="toolbox",
+            url="https://example.com/mcp",
+            auth="entra_id",
+        ))
+        out = capsys.readouterr().out
+        assert "Microsoft Entra ID" in out
+        assert "Saved" in out
+
+        config = read_raw_config()
+        srv = config["mcp_servers"]["toolbox"]
+        assert srv["auth"] == "entra_id"
+        assert srv["url"] == "https://example.com/mcp"
+
     def test_add_stdio_server(self, tmp_path, capsys, monkeypatch):
         """Add a stdio server."""
         fake_tools = [FakeTool("search", "Search repos")]
@@ -442,6 +478,23 @@ class TestMcpTest:
         assert "Connected" in out
         assert "Tools discovered: 2" in out
 
+    def test_test_shows_entra_auth(self, tmp_path, capsys, monkeypatch):
+        _seed_config(tmp_path, {
+            "toolbox": {"url": "https://example.com/mcp", "auth": "entra_id"},
+        })
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [("search", "Search")],
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="toolbox"))
+        out = capsys.readouterr().out
+        assert "Microsoft Entra ID bearer" in out
+        assert "Connected" in out
+
 
 # ---------------------------------------------------------------------------
 # Tests: env var interpolation
@@ -591,6 +644,29 @@ class TestMcpLogin:
         out = capsys.readouterr().out
         assert "not configured for OAuth" in out
 
+    def test_login_entra_probes_azure_credential(self, tmp_path, capsys, monkeypatch):
+        _seed_config(tmp_path, {
+            "srv": {"url": "https://example.com/mcp", "auth": "entra_id"},
+        })
+        monkeypatch.setattr(
+            "agent.azure_identity_adapter.reset_credential_cache",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            "agent.azure_identity_adapter.describe_active_credential",
+            lambda **kwargs: {"ok": True},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [("search", "Search")],
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_login
+        cmd_mcp_login(_make_args(name="srv"))
+        out = capsys.readouterr().out
+        assert "Microsoft Entra credential available" in out
+        assert "1 tool" in out
+
     def test_login_rejects_stdio_server(self, tmp_path, capsys):
         _seed_config(tmp_path, {
             "srv": {"command": "npx", "args": ["some-server"]},
@@ -599,4 +675,3 @@ class TestMcpLogin:
         cmd_mcp_login(_make_args(name="srv"))
         out = capsys.readouterr().out
         assert "no URL" in out or "not an OAuth" in out
-

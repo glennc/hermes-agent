@@ -108,6 +108,80 @@ def test_call_tool_handler_returns_needs_reauth_on_unrecoverable_401(monkeypatch
         mcp_tool._server_error_counts.pop("srv", None)
 
 
+def test_entra_401_returns_azure_auth_guidance(monkeypatch, tmp_path):
+    """Entra-authenticated MCP servers must not route 401s through OAuth."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    import httpx
+    from tools import mcp_tool
+    from tools.mcp_tool import _handle_auth_error_and_retry
+
+    server = MagicMock()
+    server.name = "srv"
+    server._auth_type = "entra_id"
+    server.session = MagicMock()
+    server._reconnect_event = MagicMock()
+    server._ready = MagicMock()
+    server._ready.is_set.return_value = True
+    mcp_tool._servers["srv"] = server
+    mcp_tool._server_error_counts.pop("srv", None)
+
+    response = MagicMock()
+    response.status_code = 401
+    exc = httpx.HTTPStatusError("unauth", request=MagicMock(), response=response)
+
+    def _retry_call():
+        raise exc
+
+    try:
+        monkeypatch.setattr(
+            "agent.azure_identity_adapter.reset_credential_cache",
+            lambda: None,
+        )
+        result = _handle_auth_error_and_retry(
+            "srv", exc, _retry_call, "tools/call tool1",
+        )
+        parsed = json.loads(result)
+        assert parsed.get("needs_reauth") is True
+        assert parsed.get("auth") == "entra_id"
+        assert "az login" in parsed["error"]
+        assert "hermes mcp login" not in parsed["error"]
+    finally:
+        mcp_tool._servers.pop("srv", None)
+        mcp_tool._server_error_counts.pop("srv", None)
+
+
+def test_static_header_401_does_not_suggest_oauth_login(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    import httpx
+    from tools import mcp_tool
+    from tools.mcp_tool import _handle_auth_error_and_retry
+
+    server = MagicMock()
+    server.name = "srv"
+    server._auth_type = "header"
+    server.session = MagicMock()
+    mcp_tool._servers["srv"] = server
+    mcp_tool._server_error_counts.pop("srv", None)
+
+    response = MagicMock()
+    response.status_code = 401
+    exc = httpx.HTTPStatusError("unauth", request=MagicMock(), response=response)
+
+    try:
+        result = _handle_auth_error_and_retry(
+            "srv", exc, lambda: "{}", "tools/call tool1",
+        )
+        parsed = json.loads(result)
+        assert parsed.get("auth_failed") is True
+        assert "headers" in parsed["error"]
+        assert "hermes mcp login" not in parsed["error"]
+    finally:
+        mcp_tool._servers.pop("srv", None)
+        mcp_tool._server_error_counts.pop("srv", None)
+
+
 def test_call_tool_handler_non_auth_error_still_generic(monkeypatch, tmp_path):
     """Non-auth exceptions still surface via the generic error path, not needs_reauth."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
