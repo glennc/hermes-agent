@@ -459,6 +459,57 @@ def materialize_bearer_for_http(value: Any) -> str:
     raise ValueError("no usable api_key / token provider")
 
 
+def inject_bearer_header(request: Any,
+                         token_provider: Callable[[], str],
+                         *,
+                         context: str = "Bearer hook") -> None:
+    """Install a fresh Entra bearer token on an httpx request.
+
+    Token-provider failures abort the outbound request instead of sending
+    placeholder or stale credentials.
+    """
+    try:
+        token = materialize_bearer_for_http(token_provider)
+    except ValueError as exc:
+        raise ValueError(f"{context}: {exc}") from exc
+
+    request.headers["Authorization"] = f"Bearer {token}"
+
+
+def build_bearer_http_auth(token_provider: Callable[[], str],
+                           *,
+                           context: str = "Bearer auth") -> Any:
+    """Return an ``httpx.Auth`` object for MCP HTTP/SSE bearer injection.
+
+    The Entra token provider is synchronous, so async auth materializes tokens
+    in a worker thread to avoid blocking the MCP event loop during refresh.
+    """
+    if not is_token_provider(token_provider):
+        raise ValueError(
+            "build_bearer_http_auth requires a zero-arg callable token provider"
+        )
+
+    import httpx
+
+    class _BearerTokenAuth(httpx.Auth):
+        def auth_flow(self, request: "httpx.Request"):
+            inject_bearer_header(request, token_provider, context=context)
+            yield request
+
+        async def async_auth_flow(self, request: "httpx.Request"):
+            import asyncio
+
+            await asyncio.to_thread(
+                inject_bearer_header,
+                request,
+                token_provider,
+                context=context,
+            )
+            yield request
+
+    return _BearerTokenAuth()
+
+
 def build_bearer_http_client(token_provider: Callable[[], str], **httpx_kwargs: Any) -> Any:
     """Return an ``httpx.Client`` that mints a fresh Entra bearer JWT
     per outbound request.
@@ -474,10 +525,7 @@ def build_bearer_http_client(token_provider: Callable[[], str], **httpx_kwargs: 
       1. Calls :func:`materialize_bearer_for_http` to mint a fresh JWT
          (azure-identity caches internally — this is cheap when the
          cached token is still valid).
-      2. Strips any pre-set ``Authorization`` / ``api-key`` /
-         ``x-api-key`` headers the SDK may have added (avoids
-         conflicting auth values).
-      3. Sets ``Authorization: Bearer <fresh-jwt>``.
+      2. Sets ``Authorization: Bearer <fresh-jwt>``.
 
     ``token_provider`` must be a zero-arg callable returning a string —
     typically the result of :func:`build_token_provider`.
@@ -505,34 +553,7 @@ def build_bearer_http_client(token_provider: Callable[[], str], **httpx_kwargs: 
         ) from exc
 
     def _inject_bearer(request: "httpx.Request") -> None:
-        try:
-            token = materialize_bearer_for_http(token_provider)
-        except ValueError as exc:
-            # Token provider failed (chain exhausted, token service unreachable,
-            # az login expired, etc.). Strip any auth headers the SDK
-            # may have set — including our own placeholder sentinel
-            # ``entra-id-bearer-via-http-hook`` from
-            # ``_build_anthropic_client_with_bearer_hook`` — so the
-            # outbound request hits Azure with NO Authorization rather
-            # than with the placeholder. Azure returns a clean 401
-            # "missing auth" that is easier to diagnose than a 401
-            # against the sentinel string, and the sentinel never
-            # appears in upstream access logs.
-            #
-            # Log at WARNING (not DEBUG) so the misconfiguration is
-            # visible at default log levels.
-            logger.warning(
-                "Bearer hook: Entra ID token provider returned empty (%s) "
-                "— stripping Authorization headers. Azure will respond 401. "
-                "Run `hermes doctor` or `az login` to recover.",
-                exc,
-            )
-            for header_name in ("Authorization", "authorization", "Api-Key", "api-key", "X-Api-Key", "x-api-key"):
-                request.headers.pop(header_name, None)
-            return
-        for header_name in ("Authorization", "authorization", "Api-Key", "api-key", "X-Api-Key", "x-api-key"):
-            request.headers.pop(header_name, None)
-        request.headers["Authorization"] = f"Bearer {token}"
+        inject_bearer_header(request, token_provider, context="Bearer hook")
 
     return httpx.Client(
         event_hooks={"request": [_inject_bearer]},
@@ -543,12 +564,14 @@ def build_bearer_http_client(token_provider: Callable[[], str], **httpx_kwargs: 
 __all__ = [
     "EntraIdentityConfig",
     "SCOPE_AI_AZURE_DEFAULT",
+    "build_bearer_http_auth",
     "build_bearer_http_client",
     "build_credential",
     "build_token_provider",
     "describe_active_credential",
     "has_azure_identity_credentials",
     "has_azure_identity_installed",
+    "inject_bearer_header",
     "is_token_provider",
     "materialize_bearer_for_http",
     "reset_credential_cache",

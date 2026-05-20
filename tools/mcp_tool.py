@@ -288,7 +288,6 @@ _CREDENTIAL_PATTERN = re.compile(
 # so providers like MY-VAR or my.var work correctly.
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
-
 # ---------------------------------------------------------------------------
 # Security helpers
 # ---------------------------------------------------------------------------
@@ -1363,21 +1362,33 @@ class MCPServerTask:
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
 
-        # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
-        # same provider instance is reused across reconnects, pre-flow
-        # disk-watch is active, and config-time CLI code paths share state.
-        # If OAuth setup fails (e.g. non-interactive env without cached
-        # tokens), re-raise so this server is reported as failed without
-        # blocking other MCP servers from connecting.
-        _oauth_auth = None
+        # Managed HTTP auth providers inject short-lived tokens per request.
+        _transport_auth = None
         if self._auth_type == "oauth":
             try:
                 from tools.mcp_oauth_manager import get_manager
-                _oauth_auth = get_manager().get_or_build_provider(
+                _transport_auth = get_manager().get_or_build_provider(
                     self.name, url, config.get("oauth"),
                 )
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
+                raise
+        elif self._auth_type == "entra_id":
+            try:
+                from agent.azure_identity_adapter import (
+                    EntraIdentityConfig,
+                    build_bearer_http_auth,
+                    build_token_provider,
+                )
+
+                entra_config = EntraIdentityConfig.from_dict(config.get("entra"))
+                token_provider = build_token_provider(config=entra_config)
+                _transport_auth = build_bearer_http_auth(
+                    token_provider,
+                    context=f"MCP Entra auth '{self.name}'",
+                )
+            except Exception as exc:
+                logger.warning("MCP Entra ID setup failed for '%s': %s", self.name, exc)
                 raise
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
@@ -1408,11 +1419,8 @@ class MCPServerTask:
                 "timeout": float(connect_timeout),
                 "sse_read_timeout": 300.0,
             }
-            if _oauth_auth is not None:
-                # Pass OAuth auth through to sse_client so SSE MCP servers
-                # behind OAuth 2.1 PKCE work. Previously built but never
-                # forwarded — SSE OAuth would silently fail with 401s.
-                _sse_kwargs["auth"] = _oauth_auth
+            if _transport_auth is not None:
+                _sse_kwargs["auth"] = _transport_auth
             async with sse_client(**_sse_kwargs) as (read_stream, write_stream):
                 async with ClientSession(
                     read_stream, write_stream, **sampling_kwargs
@@ -1454,8 +1462,8 @@ class MCPServerTask:
             }
             if headers:
                 client_kwargs["headers"] = headers
-            if _oauth_auth is not None:
-                client_kwargs["auth"] = _oauth_auth
+            if _transport_auth is not None:
+                client_kwargs["auth"] = _transport_auth
 
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.
@@ -1481,8 +1489,8 @@ class MCPServerTask:
                 "timeout": float(connect_timeout),
                 "verify": ssl_verify,
             }
-            if _oauth_auth is not None:
-                _http_kwargs["auth"] = _oauth_auth
+            if _transport_auth is not None:
+                _http_kwargs["auth"] = _transport_auth
             async with streamablehttp_client(url, **_http_kwargs) as (
                 read_stream, write_stream, _get_session_id,
             ):
@@ -1518,7 +1526,8 @@ class MCPServerTask:
         """
         self._config = config
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
-        self._auth_type = (config.get("auth") or "").lower().strip()
+        auth_value = config.get("auth")
+        self._auth_type = auth_value if isinstance(auth_value, str) else ""
 
         # Set up sampling handler if enabled and SDK types are available
         sampling_config = config.get("sampling", {})
@@ -1833,6 +1842,74 @@ def _is_auth_error(exc: BaseException) -> bool:
     return True
 
 
+def _is_http_unauthorized_error(exc: BaseException) -> bool:
+    """Return True for httpx HTTPStatusError(401)."""
+    try:
+        import httpx
+        return (
+            isinstance(exc, httpx.HTTPStatusError)
+            and getattr(exc.response, "status_code", None) == 401
+        )
+    except ImportError:
+        return False
+
+
+def _server_auth_type(server_name: str, exc: BaseException) -> str:
+    """Best-effort auth type for an MCP server during error handling."""
+    with _lock:
+        srv = _servers.get(server_name)
+    raw = getattr(srv, "_auth_type", "") if srv is not None else ""
+    auth_type = raw if isinstance(raw, str) else ""
+    # Non-httpx auth exceptions come from the MCP OAuth SDK/provider.
+    if not auth_type and not _is_http_unauthorized_error(exc):
+        return "oauth"
+    return auth_type
+
+
+def _signal_reconnect_and_retry(
+    server_name: str,
+    retry_call,
+    op_description: str,
+) -> str | None:
+    """Signal MCP transport reconnect and retry an operation once."""
+    with _lock:
+        srv = _servers.get(server_name)
+    if srv is not None and hasattr(srv, "_reconnect_event"):
+        loop = _mcp_loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(srv._reconnect_event.set)
+            # Wait briefly for the session to come back ready. Bounded so
+            # that a stuck reconnect falls through to the error path rather
+            # than hanging the caller.
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if srv.session is not None and srv._ready.is_set():
+                    break
+                time.sleep(0.25)
+
+    # A successful auth-recovery decision is independent evidence that the
+    # server is viable again, so close the circuit breaker here. The retry
+    # branch below still re-bumps on failure.
+    _reset_server_error(server_name)
+
+    try:
+        result = retry_call()
+        try:
+            parsed = json.loads(result)
+            if "error" not in parsed:
+                _reset_server_error(server_name)
+                return result
+        except (json.JSONDecodeError, TypeError):
+            _reset_server_error(server_name)
+            return result
+    except Exception as retry_exc:
+        logger.warning(
+            "MCP %s/%s retry after auth recovery failed: %s",
+            server_name, op_description, retry_exc,
+        )
+    return None
+
+
 def _handle_auth_error_and_retry(
     server_name: str,
     exc: BaseException,
@@ -1870,6 +1947,54 @@ def _handle_auth_error_and_retry(
     if not _is_auth_error(exc):
         return None
 
+    auth_type = _server_auth_type(server_name, exc)
+
+    if auth_type == "entra_id":
+        try:
+            from agent.azure_identity_adapter import reset_credential_cache
+            reset_credential_cache()
+        except Exception as rec_exc:
+            logger.warning(
+                "MCP Entra '%s': credential-cache reset failed: %s",
+                server_name,
+                rec_exc,
+            )
+
+        retry_result = _signal_reconnect_and_retry(
+            server_name, retry_call, op_description,
+        )
+        if retry_result is not None:
+            return retry_result
+
+        _bump_server_error(server_name)
+        return json.dumps({
+            "error": (
+                f"MCP server '{server_name}' returned 401 Unauthorized while "
+                "using Microsoft Entra ID auth. Run `az login` or configure "
+                "AZURE_* credentials, verify the identity has access to the "
+                "Foundry project (for Toolbox endpoints, the Foundry User "
+                "role is required), and confirm the configured Entra scope "
+                "matches the target resource (default: "
+                "https://ai.azure.com/.default). Do NOT retry this tool until "
+                "Azure authentication is fixed."
+            ),
+            "needs_reauth": True,
+            "auth": "entra_id",
+            "server": server_name,
+        }, ensure_ascii=False)
+
+    if auth_type != "oauth":
+        _bump_server_error(server_name)
+        return json.dumps({
+            "error": (
+                f"MCP server '{server_name}' returned 401 Unauthorized. "
+                "Check the configured MCP authentication headers or token. "
+                "Do NOT retry this tool until the server credentials are fixed."
+            ),
+            "auth_failed": True,
+            "server": server_name,
+        }, ensure_ascii=False)
+
     from tools.mcp_oauth_manager import get_manager
     manager = get_manager()
 
@@ -1886,46 +2011,11 @@ def _handle_auth_error_and_retry(
         recovered = False
 
     if recovered:
-        with _lock:
-            srv = _servers.get(server_name)
-        if srv is not None and hasattr(srv, "_reconnect_event"):
-            loop = _mcp_loop
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(srv._reconnect_event.set)
-                # Wait briefly for the session to come back ready. Bounded
-                # so that a stuck reconnect falls through to the error
-                # path rather than hanging the caller.
-                deadline = time.monotonic() + 15
-                while time.monotonic() < deadline:
-                    if srv.session is not None and srv._ready.is_set():
-                        break
-                    time.sleep(0.25)
-
-        # A successful OAuth recovery is independent evidence that the
-        # server is viable again, so close the circuit breaker here —
-        # not only on retry success. Without this, a reconnect
-        # followed by a failing retry would leave the breaker pinned
-        # above threshold forever (the retry-exception branch below
-        # bumps the count again).  The post-reset retry still goes
-        # through _bump_server_error on failure, so a genuinely broken
-        # server will re-trip the breaker as normal.
-        _reset_server_error(server_name)
-
-        try:
-            result = retry_call()
-            try:
-                parsed = json.loads(result)
-                if "error" not in parsed:
-                    _reset_server_error(server_name)
-                    return result
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)
-                return result
-        except Exception as retry_exc:
-            logger.warning(
-                "MCP %s/%s retry after auth recovery failed: %s",
-                server_name, op_description, retry_exc,
-            )
+        retry_result = _signal_reconnect_and_retry(
+            server_name, retry_call, op_description,
+        )
+        if retry_result is not None:
+            return retry_result
 
     # No recovery available, or retry also failed: surface a structured
     # needs_reauth error. Bumps the circuit breaker so the model stops

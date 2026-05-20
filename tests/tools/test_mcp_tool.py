@@ -1569,6 +1569,72 @@ class TestHTTPConfig:
         assert captured["legacy_headers"]["MCP-Protocol-Version"] == "custom-version"
         assert "mcp-protocol-version" not in captured["legacy_headers"]
 
+    def test_http_entra_auth_passes_configured_headers(self):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("remote")
+        server._auth_type = "entra_id"
+        captured = {}
+        fake_auth = object()
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyTransportCtx:
+            async def __aenter__(self):
+                return MagicMock(), MagicMock(), (lambda: None)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class DummySession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def initialize(self):
+                return None
+
+        async def _discover_tools(self):
+            self._shutdown_event.set()
+
+        async def _run():
+            with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._MCP_NEW_HTTP", True), \
+                 patch("httpx.AsyncClient", DummyAsyncClient), \
+                 patch("tools.mcp_tool.streamable_http_client", return_value=DummyTransportCtx()), \
+                 patch("tools.mcp_tool.ClientSession", DummySession), \
+                 patch("agent.azure_identity_adapter.build_token_provider", return_value=lambda: "jwt"), \
+                 patch("agent.azure_identity_adapter.build_bearer_http_auth", return_value=fake_auth), \
+                 patch.object(MCPServerTask, "_discover_tools", _discover_tools):
+                await server._run_http({
+                    "url": "https://example.com/mcp",
+                    "auth": "entra_id",
+                    "headers": {
+                        "Authorization": "Bearer stale",
+                        "X-Custom-Feature": "preview",
+                    },
+                })
+
+        asyncio.run(_run())
+
+        assert captured["auth"] is fake_auth
+        assert captured["headers"]["Authorization"] == "Bearer stale"
+        assert captured["headers"]["X-Custom-Feature"] == "preview"
+        assert "mcp-protocol-version" in captured["headers"]
+
 
 # ---------------------------------------------------------------------------
 # Reconnection logic
