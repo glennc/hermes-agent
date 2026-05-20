@@ -82,8 +82,9 @@ mcp_servers:
 mcp_servers:
   server_name:
     url: "https://my-server.example.com/mcp"   # (required) server URL
+    auth: entra_id                               # (optional) Microsoft Entra bearer auth
     headers:                                     # (optional) HTTP headers
-      Authorization: "Bearer sk-..."
+      X-Custom-Header: "value"
     timeout: 180               # (optional) per-tool-call timeout in seconds, default: 120
     connect_timeout: 60        # (optional) initial connection timeout in seconds, default: 60
 ```
@@ -96,6 +97,7 @@ mcp_servers:
 | `args`            | list   | `[]`    | Arguments passed to the command                   |
 | `env`             | dict   | `{}`    | Extra environment variables for the subprocess    |
 | `url`             | string | --      | Server URL (HTTP transport, required)             |
+| `auth`            | string | --      | `oauth`, `header`, or `entra_id` for HTTP auth    |
 | `headers`         | dict   | `{}`    | HTTP headers sent with every request              |
 | `timeout`         | int    | `120`   | Per-tool-call timeout in seconds                  |
 | `connect_timeout` | int    | `60`    | Timeout for initial connection and discovery      |
@@ -168,6 +170,18 @@ mcp_servers:
     url: "https://mcp.example.com/mcp"
     headers:
       Authorization: "Bearer sk-..."
+```
+
+For Microsoft Entra-authenticated MCP endpoints, use managed bearer auth and
+keep any non-authentication headers in `headers`:
+
+```yaml
+mcp_servers:
+  remote_api:
+    url: "https://mcp.example.com/mcp"
+    auth: entra_id
+    headers:
+      X-Custom-Header: "value"
 ```
 
 If HTTP support is not available in your installed `mcp` version, the server will fail with an ImportError and other servers will continue normally.
