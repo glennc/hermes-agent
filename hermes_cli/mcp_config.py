@@ -30,6 +30,7 @@ from tools.mcp_tool import _ENV_VAR_PATTERN
 logger = logging.getLogger(__name__)
 
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
 _MCP_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -125,6 +126,30 @@ def _parse_env_assignments(raw_env: Optional[List[str]]) -> Dict[str, str]:
         if not _ENV_VAR_NAME_RE.match(key):
             raise ValueError(f"Invalid --env variable name '{key}'")
         parsed[key] = value
+    return parsed
+
+
+def _parse_header_assignments(raw_headers: Optional[List[str]]) -> Dict[str, str]:
+    """Parse ``NAME=VALUE`` strings from CLI args into an HTTP headers dict."""
+    parsed: Dict[str, str] = {}
+    for item in raw_headers or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if "=" not in text:
+            raise ValueError(f"Invalid --header value '{text}' (expected NAME=VALUE)")
+        name, value = text.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            raise ValueError(f"Invalid --header value '{text}' (missing header name)")
+        if not _HEADER_NAME_RE.match(name):
+            raise ValueError(f"Invalid --header name '{name}'")
+        if "\r" in value or "\n" in value:
+            raise ValueError(
+                f"Invalid --header value for '{name}' (newlines are not allowed)"
+            )
+        parsed[name] = value
     return parsed
 
 
@@ -235,10 +260,12 @@ def cmd_mcp_add(args):
     auth_type = getattr(args, "auth", None) or ""
     preset_name = getattr(args, "preset", None)
     raw_env = getattr(args, "env", None)
+    raw_headers = getattr(args, "header", None)
 
     server_config: Dict[str, Any] = {}
     try:
         explicit_env = _parse_env_assignments(raw_env)
+        explicit_headers = _parse_header_assignments(raw_headers)
         url, command, cmd_args, _preset_applied = _apply_mcp_preset(
             name,
             preset_name=preset_name,
@@ -253,6 +280,9 @@ def cmd_mcp_add(args):
 
     if url and explicit_env:
         _error("--env is only supported for stdio MCP servers (--command or stdio presets)")
+        return
+    if command and explicit_headers:
+        _error("--header is only supported for HTTP MCP servers (--url)")
         return
 
     # Validate transport
@@ -274,6 +304,8 @@ def cmd_mcp_add(args):
     # Build initial config
     if url:
         server_config["url"] = url
+        if explicit_headers:
+            server_config["headers"] = explicit_headers
     else:
         server_config["command"] = command
         if cmd_args:
@@ -358,9 +390,8 @@ def cmd_mcp_add(args):
 
                 # Set header with env var interpolation
                 if api_key or existing_key:
-                    server_config["headers"] = {
-                        "Authorization": f"Bearer ${{{env_key}}}"
-                    }
+                    headers = server_config.setdefault("headers", {})
+                    headers["Authorization"] = f"Bearer ${{{env_key}}}"
 
     # ── Discovery: connect and list tools ─────────────────────────────
 
@@ -843,7 +874,7 @@ def mcp_command(args):
         cmd_mcp_list()
         print(color("  Commands:", Colors.CYAN))
         _info("hermes mcp serve                              Run as MCP server")
-        _info("hermes mcp add <name> --url <endpoint>        Add an MCP server")
+        _info("hermes mcp add <name> --url <endpoint> [--header K=V]  Add HTTP server")
         _info("hermes mcp add <name> --command <cmd>         Add a stdio server")
         _info("hermes mcp add <name> --preset <preset>       Add from a known preset")
         _info("hermes mcp remove <name>                      Remove a server")

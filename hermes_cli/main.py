@@ -12995,6 +12995,13 @@ Examples:
         choices=["oauth", "header", "entra_id"],
         help="Auth method",
     )
+    mcp_add_p.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="HTTP header for remote MCP requests (repeatable)",
+    )
     mcp_add_p.add_argument("--preset", help="Known MCP preset name")
     mcp_add_p.add_argument(
         "--env",
