@@ -41,6 +41,7 @@ def _build_parser():
     mcp_add.add_argument("name")
     mcp_add.add_argument("--url")
     mcp_add.add_argument("--command", dest="mcp_command")
+    mcp_add.add_argument("--header", action="append", default=[])
 
     return parser
 
@@ -62,6 +63,7 @@ class TestMcpAddCommandDest:
         assert args.name == "foo"
         assert args.url == "https://example.com/mcp"
         assert args.mcp_command is None
+        assert args.header == []
 
     def test_command_flag_writes_to_mcp_command_dest(self):
         """`--command npx` must populate args.mcp_command, not args.command."""
@@ -72,6 +74,24 @@ class TestMcpAddCommandDest:
 
         assert args.command == "mcp"
         assert args.mcp_command == "npx"
+
+    def test_header_flag_is_repeatable(self):
+        """`--header` must support one or more NAME=VALUE entries."""
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "mcp", "add", "toolbox",
+                "--url", "https://example.com/mcp",
+                "--header", "Foundry-Features=Toolboxes=V1Preview",
+                "--header", "X-Test=one",
+            ]
+        )
+
+        assert args.command == "mcp"
+        assert args.header == [
+            "Foundry-Features=Toolboxes=V1Preview",
+            "X-Test=one",
+        ]
 
     def test_bare_mcp_add_does_not_clobber_command(self):
         """Even without --url or --command, args.command stays "mcp".
@@ -85,3 +105,4 @@ class TestMcpAddCommandDest:
         assert args.command == "mcp"
         assert args.mcp_command is None
         assert args.url is None
+        assert args.header == []

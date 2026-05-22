@@ -1002,7 +1002,7 @@ Manage MCP (Model Context Protocol) server configurations and run Hermes as an M
 | Subcommand | Description |
 |------------|-------------|
 | `serve [-v\|--verbose]` | Run Hermes as an MCP server — expose conversations to other agents. |
-| `add <name> [--url URL] [--command CMD] [--args ...] [--auth oauth\|header]` | Add an MCP server with automatic tool discovery. |
+| `add <name> [--url URL] [--command CMD] [--args ...] [--auth oauth\|header\|entra_id] [--header NAME=VALUE]` | Add an MCP server with automatic tool discovery. |
 | `remove <name>` (alias: `rm`) | Remove an MCP server from config. |
 | `list` (alias: `ls`) | List configured MCP servers. |
 | `test <name>` | Test connection to an MCP server. |

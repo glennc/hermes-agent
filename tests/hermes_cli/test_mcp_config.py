@@ -46,6 +46,7 @@ def _make_args(**kwargs):
         "mcp_command": None,
         "args": None,
         "auth": None,
+        "header": None,
         "preset": None,
         "env": None,
         "mcp_action": None,
@@ -252,6 +253,47 @@ class TestMcpAdd:
         assert srv["auth"] == "entra_id"
         assert srv["url"] == "https://example.com/mcp"
 
+    def test_add_http_server_with_entra_auth_and_header(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """HTTP headers supplied on the CLI are saved alongside managed auth."""
+        fake_tools = [FakeTool("search", "Search")]
+
+        def mock_probe(name, config, **kw):
+            assert config["auth"] == "entra_id"
+            assert config["headers"] == {
+                "Foundry-Features": "Toolboxes=V1Preview",
+            }
+            return [(t.name, t.description) for t in fake_tools]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        monkeypatch.setattr(
+            "agent.azure_identity_adapter.describe_active_credential",
+            lambda **kwargs: {"ok": True},
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "")
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+        from hermes_cli.config import read_raw_config
+
+        cmd_mcp_add(_make_args(
+            name="toolbox",
+            url="https://example.com/mcp",
+            auth="entra_id",
+            header=["Foundry-Features=Toolboxes=V1Preview"],
+        ))
+        out = capsys.readouterr().out
+        assert "Saved" in out
+
+        config = read_raw_config()
+        srv = config["mcp_servers"]["toolbox"]
+        assert srv["auth"] == "entra_id"
+        assert srv["headers"] == {
+            "Foundry-Features": "Toolboxes=V1Preview",
+        }
+
     def test_add_stdio_server(self, tmp_path, capsys, monkeypatch):
         """Add a stdio server."""
         fake_tools = [FakeTool("search", "Search repos")]
@@ -367,6 +409,31 @@ class TestMcpAdd:
         ))
         out = capsys.readouterr().out
         assert "only supported for stdio MCP servers" in out
+
+    def test_add_http_server_rejects_invalid_header_name(self, capsys):
+        """Invalid HTTP header names are rejected up front."""
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(
+            name="ink",
+            url="https://mcp.ml.ink/mcp",
+            header=["Bad Header=value"],
+        ))
+        out = capsys.readouterr().out
+        assert "Invalid --header name" in out
+
+    def test_add_stdio_server_rejects_header_flag(self, capsys):
+        """The --header flag is only valid for HTTP transports."""
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(
+            name="github",
+            mcp_command="npx",
+            args=["@mcp/github"],
+            header=["X-Test=value"],
+        ))
+        out = capsys.readouterr().out
+        assert "only supported for HTTP MCP servers" in out
 
     def test_add_preset_fills_transport(self, tmp_path, capsys, monkeypatch):
         """A preset fills in command/args when no explicit transport given."""
