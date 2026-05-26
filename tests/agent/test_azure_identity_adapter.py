@@ -20,6 +20,7 @@ real Azure endpoint. Tests must remain hermetic per AGENTS.md.
 from __future__ import annotations
 
 import sys
+import asyncio
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import cast
@@ -126,7 +127,7 @@ class TestBuildBearerHttpClient:
         finally:
             client.close()
 
-    def test_hook_overrides_authorization_header(self):
+    def test_hook_sets_authorization_header(self):
         import httpx
         from agent.azure_identity_adapter import build_bearer_http_client
 
@@ -139,8 +140,8 @@ class TestBuildBearerHttpClient:
         client = build_bearer_http_client(provider)
         try:
             hook = client.event_hooks["request"][0]
-            # Build a request with conflicting pre-set headers and verify
-            # the hook strips them and installs the fresh bearer.
+            # Build a request with pre-set headers and verify the hook
+            # installs the fresh bearer without touching unrelated headers.
             req = httpx.Request(
                 "POST", "https://example.com/v1/messages",
                 headers={
@@ -152,10 +153,8 @@ class TestBuildBearerHttpClient:
             )
             hook(req)
             assert req.headers["Authorization"] == "Bearer jwt-1"
-            # The static-key headers must be stripped — sending both
-            # auth values would be ambiguous on Azure.
-            assert "api-key" not in req.headers
-            assert "x-api-key" not in req.headers
+            assert req.headers["api-key"] == "static-key"
+            assert req.headers["x-api-key"] == "static-key"
 
             # Second invocation mints a fresh token.
             req2 = httpx.Request("GET", "https://example.com/v1/models")
@@ -165,20 +164,8 @@ class TestBuildBearerHttpClient:
         finally:
             client.close()
 
-    def test_hook_strips_auth_headers_and_warns_when_token_provider_fails(self, caplog):
-        """When the token provider fails (chain exhausted, IMDS down, az
-        login expired), the hook must:
-          1. Log at WARNING level so the misconfiguration is visible at
-             default log level (not buried at DEBUG).
-          2. Strip any pre-set Authorization headers — including the
-             placeholder ``entra-id-bearer-via-http-hook`` sentinel that
-             :func:`_build_anthropic_client_with_bearer_hook` sets on the
-             Anthropic SDK constructor. This produces a clean
-             "missing auth" 401 from Azure rather than a sentinel-bearing
-             401 that's harder to diagnose AND avoids leaking the
-             sentinel string into upstream access logs.
-        """
-        import logging
+    def test_hook_aborts_request_when_token_provider_fails(self):
+        """A token provider failure must abort instead of sending placeholders."""
         import httpx
         from agent.azure_identity_adapter import build_bearer_http_client
 
@@ -195,16 +182,8 @@ class TestBuildBearerHttpClient:
                     "api-key": "leaked-placeholder",
                 },
             )
-            with caplog.at_level(logging.WARNING, logger="agent.azure_identity_adapter"):
-                hook(req)  # Must not raise.
-            # Pre-set auth headers stripped — no sentinel makes it to Azure.
-            assert "Authorization" not in req.headers
-            assert "api-key" not in req.headers
-            # WARNING was logged so the user sees the misconfiguration.
-            assert any(
-                rec.levelno == logging.WARNING and "Entra ID token provider" in rec.message
-                for rec in caplog.records
-            )
+            with pytest.raises(ValueError, match="Bearer hook: token provider returned empty value"):
+                hook(req)
         finally:
             client.close()
 
@@ -227,6 +206,58 @@ class TestBuildBearerHttpClient:
             assert client is not None
         finally:
             client.close()
+
+
+class TestBuildBearerHttpAuth:
+    def test_async_auth_flow_sets_fresh_bearer_and_preserves_headers(self):
+        import httpx
+        from agent.azure_identity_adapter import build_bearer_http_auth
+
+        minted_tokens = []
+
+        def provider():
+            minted_tokens.append(f"jwt-{len(minted_tokens) + 1}")
+            return minted_tokens[-1]
+
+        async def _run():
+            auth = build_bearer_http_auth(provider, context="test auth")
+            req = httpx.Request(
+                "GET",
+                "https://example.com/mcp",
+                headers={
+                    "Authorization": "Bearer stale",
+                    "api-key": "static",
+                    "X-Api-Key": "static",
+                    "Foundry-Features": "Toolboxes=V1Preview",
+                },
+            )
+            flow = auth.async_auth_flow(req)
+            authed = await flow.__anext__()
+            return authed
+
+        authed = asyncio.run(_run())
+
+        assert authed.headers["Authorization"] == "Bearer jwt-1"
+        assert authed.headers["Foundry-Features"] == "Toolboxes=V1Preview"
+        assert authed.headers["api-key"] == "static"
+        assert authed.headers["x-api-key"] == "static"
+        assert minted_tokens == ["jwt-1"]
+
+    def test_sync_auth_flow_sets_bearer(self):
+        import httpx
+        from agent.azure_identity_adapter import build_bearer_http_auth
+
+        auth = build_bearer_http_auth(lambda: "jwt")
+        req = httpx.Request("GET", "https://example.com/mcp")
+        authed = next(auth.auth_flow(req))
+
+        assert authed.headers["Authorization"] == "Bearer jwt"
+
+    def test_rejects_non_callable_provider(self):
+        from agent.azure_identity_adapter import build_bearer_http_auth
+
+        with pytest.raises(ValueError):
+            build_bearer_http_auth(cast(Callable[[], str], "plain-string"))
 
 
 class TestIsTokenProvider:

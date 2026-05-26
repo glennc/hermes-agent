@@ -149,6 +149,15 @@ mcp_servers:
       Authorization: "Bearer ***"
 ```
 
+You can also add HTTP headers through the CLI. Repeat `--header` for multiple headers; each value uses `NAME=VALUE` and preserves any additional `=` characters in the value.
+
+```bash
+hermes mcp add foundry_toolbox \
+  --url "https://example.com/mcp?api-version=v1" \
+  --auth entra_id \
+  --header "Foundry-Features=Toolboxes=V1Preview"
+```
+
 ## Built-in presets
 
 For well-known MCP servers, `hermes mcp add` accepts a `--preset` flag that fills in the transport details so you don't have to look up the command and args. The preset only supplies defaults — anything else (env vars, headers, filtering) you pass on the same command line still wins.

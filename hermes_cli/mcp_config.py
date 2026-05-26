@@ -30,6 +30,7 @@ from tools.mcp_tool import _ENV_VAR_PATTERN
 logger = logging.getLogger(__name__)
 
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
 _MCP_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -125,6 +126,30 @@ def _parse_env_assignments(raw_env: Optional[List[str]]) -> Dict[str, str]:
         if not _ENV_VAR_NAME_RE.match(key):
             raise ValueError(f"Invalid --env variable name '{key}'")
         parsed[key] = value
+    return parsed
+
+
+def _parse_header_assignments(raw_headers: Optional[List[str]]) -> Dict[str, str]:
+    """Parse ``NAME=VALUE`` strings from CLI args into an HTTP headers dict."""
+    parsed: Dict[str, str] = {}
+    for item in raw_headers or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if "=" not in text:
+            raise ValueError(f"Invalid --header value '{text}' (expected NAME=VALUE)")
+        name, value = text.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            raise ValueError(f"Invalid --header value '{text}' (missing header name)")
+        if not _HEADER_NAME_RE.match(name):
+            raise ValueError(f"Invalid --header name '{name}'")
+        if "\r" in value or "\n" in value:
+            raise ValueError(
+                f"Invalid --header value for '{name}' (newlines are not allowed)"
+            )
+        parsed[name] = value
     return parsed
 
 
@@ -232,13 +257,15 @@ def cmd_mcp_add(args):
     # hermes_cli/main.py for why the dest is renamed.
     command = getattr(args, "mcp_command", None)
     cmd_args = getattr(args, "args", None) or []
-    auth_type = getattr(args, "auth", None)
+    auth_type = getattr(args, "auth", None) or ""
     preset_name = getattr(args, "preset", None)
     raw_env = getattr(args, "env", None)
+    raw_headers = getattr(args, "header", None)
 
     server_config: Dict[str, Any] = {}
     try:
         explicit_env = _parse_env_assignments(raw_env)
+        explicit_headers = _parse_header_assignments(raw_headers)
         url, command, cmd_args, _preset_applied = _apply_mcp_preset(
             name,
             preset_name=preset_name,
@@ -253,6 +280,9 @@ def cmd_mcp_add(args):
 
     if url and explicit_env:
         _error("--env is only supported for stdio MCP servers (--command or stdio presets)")
+        return
+    if command and explicit_headers:
+        _error("--header is only supported for HTTP MCP servers (--url)")
         return
 
     # Validate transport
@@ -274,6 +304,8 @@ def cmd_mcp_add(args):
     # Build initial config
     if url:
         server_config["url"] = url
+        if explicit_headers:
+            server_config["headers"] = explicit_headers
     else:
         server_config["command"] = command
         if cmd_args:
@@ -309,6 +341,35 @@ def cmd_mcp_add(args):
                 _info("Cancelled.")
                 return
 
+    elif url and auth_type == "entra_id":
+        server_config["auth"] = "entra_id"
+        print()
+        _info("Auth: Microsoft Entra ID bearer token")
+        try:
+            from agent.azure_identity_adapter import (
+                EntraIdentityConfig,
+                describe_active_credential,
+            )
+
+            entra_config = EntraIdentityConfig.from_dict(server_config.get("entra"))
+            credential_info = describe_active_credential(
+                config=entra_config,
+                timeout_seconds=10.0,
+            )
+            if credential_info.get("ok"):
+                _success(f"Entra credential available (scope: {entra_config.scope})")
+            else:
+                _warning(
+                    "Entra credential probe failed: "
+                    f"{credential_info.get('error', 'credential unavailable')}"
+                )
+                _info(
+                    "Run `az login` or configure AZURE_* environment "
+                    "credentials before testing this server."
+                )
+        except Exception as exc:
+            _warning(f"Entra credential probe failed: {exc}")
+
     elif url:
         # Prompt for API key / Bearer token for HTTP servers
         print()
@@ -329,9 +390,8 @@ def cmd_mcp_add(args):
 
                 # Set header with env var interpolation
                 if api_key or existing_key:
-                    server_config["headers"] = {
-                        "Authorization": f"Bearer ${{{env_key}}}"
-                    }
+                    headers = server_config.setdefault("headers", {})
+                    headers["Authorization"] = f"Bearer ${{{env_key}}}"
 
     # ── Discovery: connect and list tools ─────────────────────────────
 
@@ -544,10 +604,22 @@ def cmd_mcp_test(args):
         _info(f"Transport: stdio → {cmd}")
 
     # Show auth info (masked)
-    auth_type = cfg.get("auth", "")
+    auth_type = cfg.get("auth") or ""
     headers = cfg.get("headers", {})
     if auth_type == "oauth":
         _info("Auth: OAuth 2.1 PKCE")
+    elif auth_type == "entra_id":
+        try:
+            from agent.azure_identity_adapter import (
+                EntraIdentityConfig,
+                SCOPE_AI_AZURE_DEFAULT,
+            )
+
+            entra_config = EntraIdentityConfig.from_dict(cfg.get("entra"))
+            scope = entra_config.scope or SCOPE_AI_AZURE_DEFAULT
+        except Exception:
+            scope = "https://ai.azure.com/.default"
+        _info(f"Auth: Microsoft Entra ID bearer (scope: {scope})")
     elif headers:
         for k, v in headers.items():
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
@@ -585,18 +657,7 @@ def cmd_mcp_test(args):
 # ─── hermes mcp login ────────────────────────────────────────────────────────
 
 def cmd_mcp_login(args):
-    """Force re-authentication for an OAuth-based MCP server.
-
-    Deletes cached tokens (both on disk and in the running process's
-    MCPOAuthManager cache) and triggers a fresh OAuth flow via the
-    existing probe path.
-
-    Use this when:
-      - Tokens are stuck in a bad state (server revoked, refresh token
-        consumed by an external process, etc.)
-      - You want to re-authenticate to change scopes or account
-      - A tool call returned ``needs_reauth: true``
-    """
+    """Refresh authentication for an OAuth or Entra-authenticated MCP server."""
     name = args.name
     servers = _get_mcp_servers()
 
@@ -611,32 +672,76 @@ def cmd_mcp_login(args):
     if not url:
         _error(f"Server '{name}' has no URL — not an OAuth-capable server")
         return
-    if server_config.get("auth") != "oauth":
-        _error(f"Server '{name}' is not configured for OAuth (auth={server_config.get('auth')})")
-        _info("Use `hermes mcp remove` + `hermes mcp add` to reconfigure auth.")
+    auth_type = server_config.get("auth") or ""
+
+    if auth_type == "oauth":
+        # Wipe both disk and in-memory cache so the next probe forces a fresh
+        # OAuth flow.
+        try:
+            from tools.mcp_oauth_manager import get_manager
+            mgr = get_manager()
+            mgr.remove(name)
+        except Exception as exc:
+            _warning(f"Could not clear existing OAuth state: {exc}")
+
+        print()
+        _info(f"Starting OAuth flow for '{name}'...")
+
+        # Probe triggers the OAuth flow (browser redirect + callback capture).
+        try:
+            tools = _probe_single_server(name, server_config)
+            if tools:
+                _success(f"Authenticated — {len(tools)} tool(s) available")
+            else:
+                _success("Authenticated (server reported no tools)")
+        except Exception as exc:
+            _error(f"Authentication failed: {exc}")
         return
 
-    # Wipe both disk and in-memory cache so the next probe forces a fresh
-    # OAuth flow.
-    try:
-        from tools.mcp_oauth_manager import get_manager
-        mgr = get_manager()
-        mgr.remove(name)
-    except Exception as exc:
-        _warning(f"Could not clear existing OAuth state: {exc}")
+    if auth_type == "entra_id":
+        try:
+            from agent.azure_identity_adapter import (
+                EntraIdentityConfig,
+                describe_active_credential,
+                reset_credential_cache,
+            )
 
-    print()
-    _info(f"Starting OAuth flow for '{name}'...")
+            reset_credential_cache()
+            entra_config = EntraIdentityConfig.from_dict(server_config.get("entra"))
+            info = describe_active_credential(
+                config=entra_config,
+                timeout_seconds=10.0,
+            )
+        except Exception as exc:
+            _error(f"Microsoft Entra credential probe failed: {exc}")
+            _info("Run `az login` or configure AZURE_* credentials, then retry.")
+            return
 
-    # Probe triggers the OAuth flow (browser redirect + callback capture).
-    try:
-        tools = _probe_single_server(name, server_config)
-        if tools:
-            _success(f"Authenticated — {len(tools)} tool(s) available")
-        else:
-            _success("Authenticated (server reported no tools)")
-    except Exception as exc:
-        _error(f"Authentication failed: {exc}")
+        if not info.get("ok"):
+            _error(
+                "Microsoft Entra credential unavailable: "
+                f"{info.get('error', 'credential chain exhausted')}"
+            )
+            _info("Run `az login` or configure AZURE_* credentials, then retry.")
+            return
+
+        _success("Microsoft Entra credential available")
+        _info("Testing the MCP server with a fresh bearer token...")
+        try:
+            tools = _probe_single_server(name, server_config)
+            if tools:
+                _success(f"Authenticated — {len(tools)} tool(s) available")
+            else:
+                _success("Authenticated (server reported no tools)")
+        except Exception as exc:
+            _error(f"Authentication failed: {exc}")
+        return
+
+    _error(
+        f"Server '{name}' is not configured for OAuth or Entra ID "
+        f"(auth={server_config.get('auth')})"
+    )
+    _info("Use `hermes mcp remove` + `hermes mcp add` to reconfigure auth.")
 
 
 # ─── hermes mcp configure ────────────────────────────────────────────────────
@@ -769,7 +874,7 @@ def mcp_command(args):
         cmd_mcp_list()
         print(color("  Commands:", Colors.CYAN))
         _info("hermes mcp serve                              Run as MCP server")
-        _info("hermes mcp add <name> --url <endpoint>        Add an MCP server")
+        _info("hermes mcp add <name> --url <endpoint> [--header K=V]  Add HTTP server")
         _info("hermes mcp add <name> --command <cmd>         Add a stdio server")
         _info("hermes mcp add <name> --preset <preset>       Add from a known preset")
         _info("hermes mcp remove <name>                      Remove a server")

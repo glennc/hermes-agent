@@ -177,6 +177,41 @@ class TestSSEOAuthForwarding:
         )
         assert patch_sse_client["auth"] is fake_oauth_provider
 
+    def test_sse_client_receives_entra_auth_when_configured(self, patch_sse_client):
+        """If ``_auth_type == 'entra_id'``, ``sse_client`` receives the
+        Entra bearer httpx auth provider and preserves custom headers."""
+        from tools.mcp_tool import MCPServerTask
+
+        server = _build_server_with_sse(oauth=False)
+        server._auth_type = "entra_id"
+        fake_entra_auth = MagicMock(name="fake_entra_auth")
+
+        async def drive():
+            with patch.object(MCPServerTask, "_wait_for_lifecycle_event",
+                              new=AsyncMock(return_value="shutdown")), \
+                 patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()), \
+                 patch("agent.azure_identity_adapter.build_token_provider", return_value=lambda: "jwt"), \
+                 patch("agent.azure_identity_adapter.build_bearer_http_auth", return_value=fake_entra_auth):
+                try:
+                    await asyncio.wait_for(
+                        server._run_http({
+                            "url": "https://example.com/mcp/sse",
+                            "transport": "sse",
+                            "auth": "entra_id",
+                            "headers": {"X-Custom-Feature": "preview"},
+                            "timeout": 60,
+                        }),
+                        timeout=2.0,
+                    )
+                except (asyncio.TimeoutError, StopAsyncIteration, Exception):
+                    pass
+
+        asyncio.run(drive())
+
+        assert patch_sse_client["auth"] is fake_entra_auth
+        assert patch_sse_client["headers"]["X-Custom-Feature"] == "preview"
+        assert "Authorization" not in patch_sse_client["headers"]
+
     def test_sse_client_omits_auth_when_no_oauth_configured(self, patch_sse_client):
         """Without OAuth, ``sse_client`` should not receive an ``auth=`` kwarg.
         Passing ``None`` would be equally fine but the current code path only

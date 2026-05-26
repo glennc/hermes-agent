@@ -12990,7 +12990,18 @@ Examples:
     mcp_add_p.add_argument(
         "--args", nargs="*", default=[], help="Arguments for stdio command"
     )
-    mcp_add_p.add_argument("--auth", choices=["oauth", "header"], help="Auth method")
+    mcp_add_p.add_argument(
+        "--auth",
+        choices=["oauth", "header", "entra_id"],
+        help="Auth method",
+    )
+    mcp_add_p.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="HTTP header for remote MCP requests (repeatable)",
+    )
     mcp_add_p.add_argument("--preset", help="Known MCP preset name")
     mcp_add_p.add_argument(
         "--env",
@@ -13014,7 +13025,7 @@ Examples:
 
     mcp_login_p = mcp_sub.add_parser(
         "login",
-        help="Force re-authentication for an OAuth-based MCP server",
+        help="Refresh authentication for an OAuth or Entra-based MCP server",
     )
     mcp_login_p.add_argument("name", help="Server name to re-authenticate")
 
