@@ -150,6 +150,7 @@ _LONG_HANDLERS = frozenset(
     {
         "browser.manage",
         "cli.exec",
+        "maintenance.run",
         "session.branch",
         "session.compress",
         "session.resume",
@@ -5406,6 +5407,16 @@ def _(rid, params: dict) -> dict:
         )
     except Exception as e:
         return _ok(rid, {"ok": False, "error": str(e)})
+
+
+@method("maintenance.run")
+def _(rid, params: dict) -> dict:
+    try:
+        from tui_gateway import maintenance
+
+        return _ok(rid, maintenance.run(params))
+    except Exception as e:
+        return _err(rid, 5020, str(e))
 
 
 # ── Methods: tools & system ──────────────────────────────────────────

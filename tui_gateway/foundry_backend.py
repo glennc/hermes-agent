@@ -229,13 +229,54 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
 
 def _endpoint() -> str:
-    return (
+    explicit = (
         os.environ.get("HERMES_FOUNDRY_ENDPOINT")
         or os.environ.get("HERMES_FOUNDRY_PROJECT_ENDPOINT")
         or os.environ.get("HERMES_FOUNDRY_LOCAL_ENDPOINT")
-        or os.environ.get("AZURE_AI_PROJECT_ENDPOINT")
-        or _DEFAULT_ENDPOINT
-    ).rstrip("/")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit.rstrip("/")
+
+    project_endpoint = (os.environ.get("AZURE_AI_PROJECT_ENDPOINT") or "").strip()
+    if project_endpoint:
+        return project_endpoint.rstrip("/")
+
+    project_name = (
+        os.environ.get("HERMES_FOUNDRY_PROJECT_NAME")
+        or os.environ.get("AZURE_AI_PROJECT_NAME")
+        or ""
+    ).strip()
+    for account_endpoint in (
+        os.environ.get("AZURE_AI_SERVICES_ENDPOINT"),
+        os.environ.get("AZURE_OPENAI_ENDPOINT"),
+        os.environ.get("AZURE_FOUNDRY_BASE_URL"),
+    ):
+        endpoint = _project_endpoint_from_account_endpoint(account_endpoint, project_name)
+        if endpoint:
+            return endpoint
+
+    return _DEFAULT_ENDPOINT
+
+
+def _project_endpoint_from_account_endpoint(
+    account_endpoint: str | None, project_name: str
+) -> str:
+    if not account_endpoint or not project_name:
+        return ""
+
+    base = account_endpoint.strip().rstrip("/")
+    if not base:
+        return ""
+    if "/api/projects/" in base:
+        return base
+
+    for suffix in ("/openai/v1", "/openai"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+            break
+
+    return f"{base}/api/projects/{quote(project_name, safe='')}"
 
 
 def _agent_name() -> str:
@@ -422,6 +463,7 @@ def _headers() -> dict[str, str]:
     headers = {
         "Accept": "text/event-stream, application/json",
         "Content-Type": "application/json",
+        "Foundry-Features": "HostedAgents=V1Preview",
     }
     token = _acquire_token()
     if token:

@@ -280,6 +280,50 @@ def test_invocations_url_uses_foundry_protocol_path(monkeypatch, foundry_backend
     assert "api-version=v1" in url
 
 
+def test_endpoint_prefers_project_endpoint_for_agent_invocations(monkeypatch, foundry_backend):
+    monkeypatch.delenv("HERMES_FOUNDRY_ENDPOINT", raising=False)
+    monkeypatch.delenv("HERMES_FOUNDRY_PROJECT_ENDPOINT", raising=False)
+    monkeypatch.delenv("HERMES_FOUNDRY_LOCAL_ENDPOINT", raising=False)
+    monkeypatch.setenv("AZURE_AI_PROJECT_NAME", "project one")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://acct.openai.azure.com/")
+    monkeypatch.setenv(
+        "AZURE_AI_PROJECT_ENDPOINT",
+        "https://acct.services.ai.azure.com/api/projects/project-one",
+    )
+
+    assert (
+        foundry_backend._endpoint()
+        == "https://acct.services.ai.azure.com/api/projects/project-one"
+    )
+
+
+def test_endpoint_normalizes_openai_base_url_suffix(monkeypatch, foundry_backend):
+    monkeypatch.delenv("HERMES_FOUNDRY_ENDPOINT", raising=False)
+    monkeypatch.delenv("HERMES_FOUNDRY_PROJECT_ENDPOINT", raising=False)
+    monkeypatch.delenv("HERMES_FOUNDRY_LOCAL_ENDPOINT", raising=False)
+    monkeypatch.delenv("AZURE_AI_PROJECT_ENDPOINT", raising=False)
+    monkeypatch.delenv("AZURE_AI_SERVICES_ENDPOINT", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    monkeypatch.setenv("AZURE_AI_PROJECT_NAME", "project-one")
+    monkeypatch.setenv(
+        "AZURE_FOUNDRY_BASE_URL", "https://acct.openai.azure.com/openai/v1"
+    )
+
+    assert (
+        foundry_backend._endpoint()
+        == "https://acct.openai.azure.com/api/projects/project-one"
+    )
+
+
+def test_headers_include_hosted_agents_preview_feature(monkeypatch, foundry_backend):
+    monkeypatch.setenv("HERMES_FOUNDRY_BEARER_TOKEN", "test-token")
+
+    headers = foundry_backend._headers()
+
+    assert headers["Foundry-Features"] == "HostedAgents=V1Preview"
+    assert headers["Authorization"] == "Bearer test-token"
+
+
 def test_invocations_url_uses_configured_local_path(monkeypatch, foundry_backend):
     monkeypatch.setenv("HERMES_FOUNDRY_ENDPOINT", "http://localhost:8088")
     monkeypatch.setenv("HERMES_FOUNDRY_INVOCATIONS_PATH", "/invocations")
