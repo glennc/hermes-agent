@@ -70,6 +70,8 @@ _DEFAULT_AGENT_NAME = "hermes-foundry-agent"
 _DEFAULT_API_VERSION = "v1"
 _REQUEST_TIMEOUT_S = 120.0
 _CONTROL_TIMEOUT_S = 15.0
+_USER_ISOLATION_HEADER = "x-ms-user-isolation-key"
+_CHAT_ISOLATION_HEADER = "x-ms-chat-isolation-key"
 
 # Async dispatch — mirrors the local server.py pattern. Slash workers, shell
 # execs, session lifecycle, and skill ops can each block for many seconds
@@ -411,13 +413,69 @@ def _entra_oid() -> str:
     return _cached_oid
 
 
+def _explicit_workspace_key() -> str:
+    return (os.environ.get("HERMES_FOUNDRY_WORKSPACE_KEY") or "").strip()
+
+
 def _workspace_key() -> str:
-    explicit = (os.environ.get("HERMES_FOUNDRY_WORKSPACE_KEY") or "").strip()
+    explicit = _explicit_workspace_key()
     if explicit:
         return explicit
 
     digest = hashlib.sha256(_entra_oid().encode("utf-8")).hexdigest()[:16]
     return f"tui-{digest}"
+
+
+def _derived_isolation_key(prefix: str, value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}-{digest}"
+
+
+def _validate_isolation_key(value: str, name: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise RuntimeError(f"{name} must not be empty.")
+    for char in normalized:
+        if not (char.isalnum() or char in "-_"):
+            raise RuntimeError(
+                f"{name} contains invalid character {char!r}; only alphanumeric "
+                "characters, hyphens, and underscores are allowed."
+            )
+    return normalized
+
+
+def _user_isolation_key() -> str:
+    explicit = (os.environ.get("HERMES_FOUNDRY_USER_ISOLATION_KEY") or "").strip()
+    if explicit:
+        return _validate_isolation_key(explicit, "HERMES_FOUNDRY_USER_ISOLATION_KEY")
+
+    try:
+        return _derived_isolation_key("tui-user", _entra_oid())
+    except RuntimeError:
+        workspace = _explicit_workspace_key()
+        if workspace:
+            return _derived_isolation_key("tui-user", f"workspace:{workspace}")
+        raise
+
+
+def _chat_isolation_key(session: dict[str, Any] | None = None) -> str:
+    explicit = (os.environ.get("HERMES_FOUNDRY_CHAT_ISOLATION_KEY") or "").strip()
+    if explicit:
+        return _validate_isolation_key(explicit, "HERMES_FOUNDRY_CHAT_ISOLATION_KEY")
+
+    workspace = ""
+    if session is not None:
+        workspace = str(session.get("workspace") or "").strip()
+    if not workspace:
+        workspace = _workspace_key()
+    return _derived_isolation_key("tui-chat", workspace)
+
+
+def _isolation_headers(session: dict[str, Any] | None = None) -> dict[str, str]:
+    return {
+        _USER_ISOLATION_HEADER: _user_isolation_key(),
+        _CHAT_ISOLATION_HEADER: _chat_isolation_key(session),
+    }
 
 
 def _invocations_url(session: dict[str, Any], invocation_id: str | None = None, *, cancel: bool = False) -> str:
@@ -459,12 +517,13 @@ def _invocations_url(session: dict[str, Any], invocation_id: str | None = None, 
     return f"{_endpoint()}{path}"
 
 
-def _headers() -> dict[str, str]:
+def _headers(session: dict[str, Any] | None = None) -> dict[str, str]:
     headers = {
         "Accept": "text/event-stream, application/json",
         "Content-Type": "application/json",
         "Foundry-Features": "HostedAgents=V1Preview",
     }
+    headers.update(_isolation_headers(session))
     token = _acquire_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -515,6 +574,7 @@ def _rpc_payload(
     return {
         "kind": "hermes.rpc",
         "invocation_id": invocation_id or uuid.uuid4().hex,
+        "isolation": _isolation_headers(session),
         "request": request,
         "session": _session_payload(sid, session),
         "tui": {"protocol_version": 1},
@@ -614,7 +674,7 @@ def _post_invocation_events(session: dict[str, Any], payload: dict[str, Any], ca
     request = Request(
         _invocations_url(session),
         data=json.dumps(payload).encode("utf-8"),
-        headers=_headers(),
+        headers=_headers(session),
         method="POST",
     )
 
@@ -640,7 +700,7 @@ def _post_rpc(session: dict[str, Any], request_body: dict[str, Any]) -> dict[str
     request = Request(
         _invocations_url(session),
         data=json.dumps(payload).encode("utf-8"),
-        headers=_headers(),
+        headers=_headers(session),
         method="POST",
     )
 
@@ -729,6 +789,7 @@ _REPLAY_GAP_WARNING_PREFIX = (
     "Some Hermes events for this session were not delivered "
     "(events through seq "
 )
+_MAINTENANCE_SUMMARY_PREFIX = "Foundry maintenance routine"
 
 
 def _subscriber_backoff_max() -> float:
@@ -754,6 +815,63 @@ def _emit_replay_gap_warning(sid: str, missed_through: int) -> None:
             ),
         },
     )
+
+
+def _format_duration(value: Any) -> str:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if seconds < 0:
+        return ""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rem = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {int(rem)}s"
+    hours, rem_minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(rem_minutes)}m"
+
+
+def _maintenance_summary_text(payload: dict[str, Any]) -> str:
+    status = str(payload.get("status") or "completed").strip() or "completed"
+    duration = _format_duration(payload.get("duration_seconds"))
+    ended_at = str(payload.get("ended_at") or "").strip()
+    run_id = str(payload.get("run_id") or "").strip()
+
+    details: list[str] = []
+    if duration:
+        details.append(f"duration {duration}")
+    if ended_at:
+        details.append(f"ended {ended_at}")
+    if run_id:
+        details.append(f"run {run_id}")
+
+    text = f"{_MAINTENANCE_SUMMARY_PREFIX} {status}"
+    if details:
+        text += f" ({', '.join(details)})"
+    text += "."
+
+    jobs = payload.get("jobs")
+    if isinstance(jobs, list) and jobs:
+        job_parts: list[str] = []
+        for item in jobs:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "job").strip() or "job"
+            job_status = str(item.get("status") or "unknown").strip() or "unknown"
+            job_text = f"{name}: {job_status}"
+            reason = str(item.get("error") or item.get("reason") or "").strip()
+            if reason:
+                job_text += f" ({reason})"
+            job_parts.append(job_text)
+        if job_parts:
+            text += " Jobs: " + "; ".join(job_parts) + "."
+
+    history_path = str(payload.get("history_path") or "").strip()
+    if history_path:
+        text += f" History: {history_path}"
+    return text
 
 
 def _event_subscriber_loop(sid: str) -> None:
@@ -928,6 +1046,17 @@ def _emit_upstream_event(sid: str, event: dict[str, Any]) -> bool:
         payload = {}
     elif not isinstance(payload, dict):
         payload = {"text": str(payload)}
+    if event_type == "maintenance.summary":
+        _emit(
+            "review.summary",
+            sid,
+            {
+                "text": _maintenance_summary_text(payload),
+                "source": "maintenance.summary",
+                "maintenance": payload,
+            },
+        )
+        return True
     _remember_pending_control(sid, event_type, payload)
     _emit(event_type, sid, payload)
     return True

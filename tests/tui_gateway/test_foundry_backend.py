@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import base64
+import hashlib
 import io
 import json
 import sys
@@ -32,6 +35,10 @@ def _drain_subscribers(backend) -> None:
         thread.join(timeout=1.0)
 
 
+def _derived_key(prefix: str, value: str) -> str:
+    return f"{prefix}-{hashlib.sha256(value.encode('utf-8')).hexdigest()[:16]}"
+
+
 @pytest.fixture(autouse=True)
 def foundry_backend(monkeypatch):
     from tui_gateway import foundry_backend as backend
@@ -47,6 +54,7 @@ def foundry_backend(monkeypatch):
     real_start_catalog_prewarm = backend._start_catalog_prewarm
     backend._start_catalog_prewarm_for_tests = real_start_catalog_prewarm
     monkeypatch.setenv("HERMES_FOUNDRY_WORKSPACE_KEY", "ws-test")
+    monkeypatch.setenv("HERMES_FOUNDRY_USER_ISOLATION_KEY", "user-test")
     monkeypatch.setattr(backend, "_post_invocation_events", noop_events)
     monkeypatch.setattr(backend, "_start_catalog_prewarm", lambda sid: None)
 
@@ -318,10 +326,23 @@ def test_endpoint_normalizes_openai_base_url_suffix(monkeypatch, foundry_backend
 def test_headers_include_hosted_agents_preview_feature(monkeypatch, foundry_backend):
     monkeypatch.setenv("HERMES_FOUNDRY_BEARER_TOKEN", "test-token")
 
-    headers = foundry_backend._headers()
+    headers = foundry_backend._headers({"workspace": "workspace-a"})
 
     assert headers["Foundry-Features"] == "HostedAgents=V1Preview"
     assert headers["Authorization"] == "Bearer test-token"
+    assert headers["x-ms-user-isolation-key"] == "user-test"
+    assert headers["x-ms-chat-isolation-key"] == _derived_key("tui-chat", "workspace-a")
+
+
+def test_headers_use_session_specific_chat_isolation(monkeypatch, foundry_backend):
+    monkeypatch.setenv("HERMES_FOUNDRY_BEARER_TOKEN", "test-token")
+
+    first = foundry_backend._headers({"workspace": "workspace-a"})
+    second = foundry_backend._headers({"workspace": "workspace-b"})
+
+    assert first["x-ms-user-isolation-key"] == second["x-ms-user-isolation-key"]
+    assert first["x-ms-chat-isolation-key"] == _derived_key("tui-chat", "workspace-a")
+    assert second["x-ms-chat-isolation-key"] == _derived_key("tui-chat", "workspace-b")
 
 
 def test_invocations_url_uses_configured_local_path(monkeypatch, foundry_backend):
@@ -344,6 +365,10 @@ def test_rpc_payload_includes_invocation_request_and_session(foundry_backend):
     assert payload == {
         "kind": "hermes.rpc",
         "invocation_id": "invoke-a",
+        "isolation": {
+            "x-ms-user-isolation-key": "user-test",
+            "x-ms-chat-isolation-key": _derived_key("tui-chat", "workspace-a"),
+        },
         "request": {
             "jsonrpc": "2.0",
             "id": "rpc-a",
@@ -794,6 +819,52 @@ def test_event_subscriber_translates_replay_gap_to_warning(monkeypatch, foundry_
         and frame["params"]["type"] == "status.update"
     )
     assert warning["params"]["payload"]["kind"] == "warning"
+
+
+def test_maintenance_summary_is_rendered_via_review_summary(monkeypatch, foundry_backend):
+    frames: list[dict] = []
+
+    def capture(obj: dict) -> bool:
+        frames.append(json.loads(json.dumps(obj)))
+        return True
+
+    monkeypatch.setattr(foundry_backend, "write_json", capture)
+
+    assert foundry_backend._emit_upstream_event(
+        "remote-a",
+        {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "maintenance.summary",
+                "session_id": "remote-a",
+                "payload": {
+                    "run_id": "run-1",
+                    "status": "completed",
+                    "duration_seconds": 65,
+                    "ended_at": "2026-05-31T18:01:05Z",
+                    "history_path": "/home/session/.hermes/foundry-maintenance/history.jsonl",
+                    "jobs": [
+                        {"name": "refresh", "status": "success"},
+                        {"name": "archive", "status": "skipped", "reason": "not stale"},
+                    ],
+                },
+            },
+        },
+    )
+
+    assert len(frames) == 1
+    frame = frames[0]
+    assert frame["params"]["type"] == "review.summary"
+    assert frame["params"]["session_id"] == "remote-a"
+    payload = frame["params"]["payload"]
+    assert payload["source"] == "maintenance.summary"
+    assert payload["maintenance"]["run_id"] == "run-1"
+    assert "Foundry maintenance routine completed" in payload["text"]
+    assert "duration 1m 5s" in payload["text"]
+    assert "refresh: success" in payload["text"]
+    assert "archive: skipped (not stale)" in payload["text"]
+    assert "/home/session/.hermes/foundry-maintenance/history.jsonl" in payload["text"]
 
 
 def test_session_close_stops_subscriber(monkeypatch, foundry_backend):
