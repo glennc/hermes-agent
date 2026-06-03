@@ -49,6 +49,13 @@ _stdout_lock = threading.Lock()
 _catalog_cache: dict[str, Any] | None = None
 _catalog_lock = threading.Lock()
 
+_CONFIG_CACHE_DEFAULT_TTL_S = 30 * 60.0
+_config_cache_lock = threading.Lock()
+_config_cache: dict[str, Any] | None = None
+_config_cache_mtime: float = 0.0
+_config_cache_fetched_at: float = 0.0
+_config_cache_refreshing = False
+
 # Hard-coded TUI extras that upstream's complete.slash injects on top
 # of SlashCommandCompleter output. Mirrors the `extras` list in
 # server.py so local autocomplete is byte-for-byte equivalent for the
@@ -539,6 +546,17 @@ def _timeout_seconds() -> float:
     except ValueError:
         return _REQUEST_TIMEOUT_S
     return value if value > 0 else _REQUEST_TIMEOUT_S
+
+
+def _config_cache_ttl_seconds() -> float:
+    raw = (os.environ.get("HERMES_FOUNDRY_CONFIG_CACHE_TTL_S") or "").strip()
+    if not raw:
+        return _CONFIG_CACHE_DEFAULT_TTL_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return _CONFIG_CACHE_DEFAULT_TTL_S
+    return value if value > 0 else _CONFIG_CACHE_DEFAULT_TTL_S
 
 
 def _read_http_error(exc: HTTPError) -> str:
@@ -1041,6 +1059,7 @@ def _emit_upstream_event(sid: str, event: dict[str, Any]) -> bool:
         # Hosted side may have restarted; the slash registry could have
         # changed. Drop the cache so the next slash press refetches.
         _invalidate_catalog()
+        _invalidate_config_cache()
 
     if payload is None:
         payload = {}
@@ -1118,6 +1137,104 @@ def _invalidate_catalog() -> None:
     global _catalog_cache
     with _catalog_lock:
         _catalog_cache = None
+
+
+def _invalidate_config_cache() -> None:
+    global _config_cache, _config_cache_mtime, _config_cache_fetched_at, _config_cache_refreshing
+    with _config_cache_lock:
+        _config_cache = None
+        _config_cache_mtime = 0.0
+        _config_cache_fetched_at = 0.0
+        _config_cache_refreshing = False
+
+
+def _config_cache_is_fresh(now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    with _config_cache_lock:
+        return (
+            _config_cache is not None
+            and _config_cache_fetched_at > 0
+            and now - _config_cache_fetched_at < _config_cache_ttl_seconds()
+        )
+
+
+def _refresh_config_cache() -> dict[str, Any] | None:
+    global _config_cache, _config_cache_mtime, _config_cache_fetched_at
+    response = _call_workspace_rpc("config.get", {"key": "full"}, uuid.uuid4().hex)
+    if response.get("error"):
+        return None
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None
+
+    config = result.get("config")
+    if not isinstance(config, dict):
+        return None
+
+    now = time.time()
+    with _config_cache_lock:
+        _config_cache = result
+        _config_cache_fetched_at = now
+        _config_cache_mtime = now
+    return result
+
+
+def _start_config_cache_refresh() -> None:
+    global _config_cache_refreshing
+    with _config_cache_lock:
+        if _config_cache_refreshing:
+            return
+        _config_cache_refreshing = True
+
+    def run() -> None:
+        global _config_cache_refreshing
+        try:
+            _refresh_config_cache()
+        except Exception as exc:
+            print(
+                f"[foundry-backend] config cache refresh failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            with _config_cache_lock:
+                _config_cache_refreshing = False
+
+    threading.Thread(
+        target=run,
+        daemon=True,
+        name="foundry-config-cache-refresh",
+    ).start()
+
+
+def _cached_config_response(rid: Any, key: str) -> dict[str, Any] | None:
+    if key not in {"full", "mtime"}:
+        return None
+
+    fresh = _config_cache_is_fresh()
+    with _config_cache_lock:
+        cached = dict(_config_cache) if isinstance(_config_cache, dict) else None
+        mtime = _config_cache_mtime
+
+    if key == "mtime":
+        if not fresh:
+            _start_config_cache_refresh()
+        return _ok(rid, {"mtime": mtime})
+
+    if cached is not None:
+        if not fresh:
+            _start_config_cache_refresh()
+        return _ok(rid, cached)
+
+    try:
+        refreshed = _refresh_config_cache()
+    except RuntimeError:
+        refreshed = None
+
+    if refreshed is not None:
+        return _ok(rid, refreshed)
+
+    return _ok(rid, {"config": dict(_config)})
 
 
 def _get_catalog(force_refresh: bool = False) -> dict[str, Any] | None:
@@ -1255,6 +1372,23 @@ def _proxy_rpc(method_name: str, params: dict[str, Any], rid: Any | None = None)
     return response
 
 
+@method("config.get")
+def _(rid, params: dict) -> dict:
+    key = str(params.get("key") or "")
+    cached = _cached_config_response(rid, key)
+    if cached is not None:
+        return cached
+    return _proxy_rpc("config.get", params, rid)
+
+
+@method("config.set")
+def _(rid, params: dict) -> dict:
+    response = _proxy_rpc("config.set", params, rid)
+    if not response.get("error"):
+        _invalidate_config_cache()
+    return response
+
+
 @method("commands.catalog")
 def _(rid, params: dict) -> dict:
     catalog = _get_catalog()
@@ -1316,6 +1450,8 @@ def _proxy_then_invalidate_catalog(method_name: str, params: dict, rid: Any) -> 
     response = _proxy_rpc(method_name, params, rid)
     if not response.get("error"):
         _invalidate_catalog()
+        if method_name in {"reload.env", "reload.mcp"}:
+            _invalidate_config_cache()
     return response
 
 

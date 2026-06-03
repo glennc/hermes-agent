@@ -62,6 +62,7 @@ def foundry_backend(monkeypatch):
     backend._pending_controls.clear()
     backend._cached_oid = None
     backend._invalidate_catalog()
+    backend._invalidate_config_cache()
     backend._shutdown_credential()
     yield backend
     _drain_subscribers(backend)
@@ -69,6 +70,7 @@ def foundry_backend(monkeypatch):
     backend._pending_controls.clear()
     backend._cached_oid = None
     backend._invalidate_catalog()
+    backend._invalidate_config_cache()
     backend._shutdown_credential()
     sys.stdout = _original_stdout
 
@@ -149,6 +151,89 @@ def test_setup_status_tunnels_to_child_gateway(monkeypatch, foundry_backend):
     assert requests == [
         {"jsonrpc": "2.0", "id": "setup", "method": "setup.status", "params": {}}
     ]
+
+
+def test_config_get_full_is_cached(monkeypatch, foundry_backend):
+    requests: list[dict] = []
+
+    def fake_post_rpc(_session, request):
+        requests.append(request)
+        return {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"config": {"display": {"tui_statusbar": "off"}}},
+        }
+
+    monkeypatch.setattr(foundry_backend, "_post_rpc", fake_post_rpc)
+
+    first = foundry_backend.dispatch(
+        {"id": "cfg1", "method": "config.get", "params": {"key": "full"}}
+    )
+    second = foundry_backend.dispatch(
+        {"id": "cfg2", "method": "config.get", "params": {"key": "full"}}
+    )
+
+    assert first["result"]["config"]["display"]["tui_statusbar"] == "off"
+    assert second["result"] == first["result"]
+    assert [request["method"] for request in requests] == ["config.get"]
+
+
+def test_config_get_mtime_uses_local_cache(monkeypatch, foundry_backend):
+    requests: list[dict] = []
+
+    def fake_post_rpc(_session, request):
+        requests.append(request)
+        return {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"config": {"display": {"tui_statusbar": "off"}}},
+        }
+
+    monkeypatch.setattr(foundry_backend, "_post_rpc", fake_post_rpc)
+
+    foundry_backend.dispatch(
+        {"id": "cfg", "method": "config.get", "params": {"key": "full"}}
+    )
+    mtime = foundry_backend.dispatch(
+        {"id": "mtime", "method": "config.get", "params": {"key": "mtime"}}
+    )
+
+    assert mtime["result"]["mtime"] > 0
+    assert [request["method"] for request in requests] == ["config.get"]
+
+
+def test_config_set_invalidates_config_cache(monkeypatch, foundry_backend):
+    requests: list[dict] = []
+
+    def fake_post_rpc(_session, request):
+        requests.append(request)
+        if request["method"] == "config.set":
+            return {"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}
+        return {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"config": {"display": {"tui_statusbar": "off"}}},
+        }
+
+    monkeypatch.setattr(foundry_backend, "_post_rpc", fake_post_rpc)
+    monkeypatch.setattr(foundry_backend, "_start_config_cache_refresh", lambda: None)
+
+    foundry_backend.dispatch(
+        {"id": "cfg", "method": "config.get", "params": {"key": "full"}}
+    )
+    foundry_backend.dispatch(
+        {
+            "id": "set",
+            "method": "config.set",
+            "params": {"key": "display.tui_statusbar", "value": "top"},
+        }
+    )
+    mtime = foundry_backend.dispatch(
+        {"id": "mtime", "method": "config.get", "params": {"key": "mtime"}}
+    )
+
+    assert mtime["result"]["mtime"] == 0
+    assert [request["method"] for request in requests] == ["config.get", "config.set"]
 
 
 def test_unknown_method_without_session_tunnels_to_workspace(monkeypatch, foundry_backend):
